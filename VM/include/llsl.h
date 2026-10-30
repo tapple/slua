@@ -23,6 +23,8 @@ enum class YieldableStatus : uint8_t {
     NOT_LUA = 3,
     INVALID_PC = 4,
     UNSUPPORTED_INSTR = 5,
+    // A resumer up the chain can't break
+    BAD_RESUMER = 6,
 };
 
 #define UTAG_QUATERNION 25
@@ -30,6 +32,23 @@ enum class YieldableStatus : uint8_t {
 #define UTAG_DETECTED_EVENT 28
 #define UTAG_LLEVENTS 29
 #define UTAG_LLTIMERS 30
+#define UTAG_STRBUF 31
+#define UTAG_OPAQUE_BUFFER 32
+// A yieldable C function's slot buffer, see lyieldable.h
+#define UTAG_YIELD_STATE 33
+// Test-only, see lua_AresTestObject
+#define UTAG_ARES_TEST 34
+
+// Passed as the status to a yieldable's continuation to get its ABI version
+// back instead of a resume
+#define LUA_YIELDABLE_ABI_QUERY (-1)
+
+// Internal global names for event/timer managers (hidden from user code)
+#define LLEVENTS_GLOBAL_NAME "/$ LLEvents"
+#define LLTIMERS_GLOBAL_NAME "/$ LLTimers"
+// Registry keys for host access to event handling
+#define LLEVENTS_HANDLEEVENT_KEY "LLEVENTS_HANDLEEVENT"
+#define LLEVENTS_TIMER_WRAPPER_GUARD_KEY "LLEVENTS_TIMER_WRAPPER_GUARD"
 
 struct TString;
 
@@ -46,13 +65,24 @@ typedef struct lua_DetectedEvent {
     bool can_change_damage;
 } lua_DetectedEvent;
 
+// Ugh. Stupid test-only hack so we can test blocks associated with
+// features, but without actually having to register a feature.
+typedef struct lua_AresTestObject {
+    int32_t base;
+    int32_t added;
+    // Bytes of a block the reader doesn't know, ahead of added's
+    uint8_t newer_block;
+    // Bytes appended to added's block that the reader doesn't know
+    uint8_t newer_tail;
+} lua_AresTestObject;
+
 struct LuaTable;
 typedef struct lua_LLEvents {
     // to be used with lua_ref(), be sure to un-pin appropriately on destruction.
     // should be a reference to a table of `event_name_str -> {table of handler closures}`
-    int listeners_tab_ref;
+    int handlers_tab_ref;
     // Having an actual pointer is valuable for quick traversal.
-    LuaTable * listeners_tab;
+    LuaTable * handlers_tab;
 } lua_LLEvents;
 
 typedef struct lua_LLTimers {
@@ -72,12 +102,15 @@ LUA_API int luaSL_pushuuidstring(lua_State *L, const char *str);
 LUA_API int luaSL_pushuuidbytes(lua_State *L, const uint8_t *bytes);
 LUA_API int luaSL_pushquaternion(lua_State *L, double x, double y, double z, double s);
 LUA_API int luaSL_pushdetectedevent(lua_State *L, int index, bool valid, bool can_change_damage);
+// Pushes every constant from the loaded builtins.txt onto _G
+LUA_API void luaSL_set_constant_globals(lua_State *L);
 LUA_API int luaSL_createeventmanager(lua_State *L);
 LUA_API int luaSL_createtimermanager(lua_State *L);
 LUA_API const char *luaSL_checkuuid(lua_State *L, int num_arg, bool * compressed);
 LUA_API const float *luaSL_checkquaternion(lua_State *L, int num_arg);
 #define luaSL_pushfloat(L, d) lua_pushnumber((L), (float)(d))
-#define luaSL_pushinteger(L, v) lua_pushlightuserdatatagged((L), (void *)((size_t)(v)), LU_TAG_LSL_INTEGER)
+// Truncates to 32-bit space like setintvalue(), LSL integers are 32-bit.
+#define luaSL_pushinteger(L, v) lua_pushinteger64((L), (int32_t)(v))
 /// push whatever is the native type for this VM
 LUA_API int luaSL_pushnativeinteger(lua_State *L, int val);
 LUA_API void luaSL_pushindexlike(lua_State *L, int index);
@@ -94,6 +127,9 @@ uint8_t lua_lsl_type(const TValue *tv);
 int lsl_cast(lua_State *L);
 int lsl_cast_list_elem(lua_State *L);
 int lsl_cast_list_elem_poszero(lua_State *L);
+int lua_quaternion_tofwd(lua_State *L);
+int lua_quaternion_toleft(lua_State *L);
+int lua_quaternion_toup(lua_State *L);
 
 void conj_quat(float *quat);
 void rot_vec(const float *vec, const float *rot, float *res);

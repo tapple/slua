@@ -1,6 +1,7 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/Substitution.h"
 
+#include "Luau/Ast.h"
 #include "Luau/Common.h"
 #include "Luau/TxnLog.h"
 #include "Luau/Type.h"
@@ -8,9 +9,8 @@
 #include <algorithm>
 
 LUAU_FASTINTVARIABLE(LuauTarjanChildLimit, 10000)
-LUAU_FASTFLAG(LuauSolverV2)
 LUAU_FASTINTVARIABLE(LuauTarjanPreallocationSize, 256)
-LUAU_FASTFLAG(LuauEmplaceNotPushBack)
+LUAU_FASTFLAG(LuauReduceTypeFunctionToSyntheticError)
 
 namespace Luau
 {
@@ -130,6 +130,11 @@ static TypeId shallowClone(TypeId ty, TypeArena& dest, const TxnLog* log)
         else if constexpr (std::is_same_v<T, ExternType>)
         {
             ExternType clone{a.name, a.props, a.parent, a.metatable, a.tags, a.userData, a.definitionModuleName, a.definitionLocation, a.indexer};
+            if (FFlag::DebugLuauUserDefinedClasses)
+            {
+                clone.isOpen = a.isOpen;
+                clone.relation = a.relation;
+            }
             return dest.addType(std::move(clone));
         }
         else if constexpr (std::is_same_v<T, NegationType>)
@@ -156,8 +161,8 @@ static TypeId shallowClone(TypeId ty, TypeArena& dest, const TxnLog* log)
 }
 
 Tarjan::Tarjan()
-    : typeToIndex(nullptr, FInt::LuauTarjanPreallocationSize)
-    , packToIndex(nullptr, FInt::LuauTarjanPreallocationSize)
+    : typeToIndex(FInt::LuauTarjanPreallocationSize)
+    , packToIndex(FInt::LuauTarjanPreallocationSize)
 {
     nodes.reserve(FInt::LuauTarjanPreallocationSize);
     stack.reserve(FInt::LuauTarjanPreallocationSize);
@@ -242,13 +247,10 @@ void Tarjan::visitChildren(TypeId ty, int index)
     {
         for (const auto& [name, prop] : etv->props)
         {
-            if (FFlag::LuauSolverV2)
-            {
+            if (prop.readTy)
                 visitChild(prop.readTy);
+            if (prop.writeTy)
                 visitChild(prop.writeTy);
-            }
-            else
-                visitChild(prop.type_DEPRECATED());
         }
 
         if (etv->parent)
@@ -262,10 +264,32 @@ void Tarjan::visitChildren(TypeId ty, int index)
             visitChild(etv->indexer->indexType);
             visitChild(etv->indexer->indexResultType);
         }
+
+        if (FFlag::DebugLuauUserDefinedClasses && etv->relation)
+        {
+            Luau::visit(
+                overloaded{
+                    [&](const Obj& obj)
+                    {
+                        visitChild(obj.ty);
+                    },
+                    [&](const Klass& klass)
+                    {
+                        visitChild(klass.ty);
+                    }
+                },
+                *etv->relation
+            );
+        }
     }
     else if (const NegationType* ntv = get<NegationType>(ty))
     {
         visitChild(ntv->ty);
+    }
+    else if (const ErrorType* err = get<ErrorType>(ty); FFlag::LuauReduceTypeFunctionToSyntheticError && err)
+    {
+        LUAU_ASSERT(ty->persistent || err->synthetic);
+        visitChild(err->synthetic);
     }
 }
 
@@ -301,10 +325,7 @@ std::pair<int, bool> Tarjan::indexify(TypeId ty)
     if (fresh)
     {
         index = int(nodes.size());
-        if (FFlag::LuauEmplaceNotPushBack)
-            nodes.emplace_back(ty, nullptr, false, false, index);
-        else
-            nodes.push_back({ty, nullptr, false, false, index});
+        nodes.emplace_back(ty, nullptr, false, false, index);
     }
 
     return {index, fresh};
@@ -319,10 +340,7 @@ std::pair<int, bool> Tarjan::indexify(TypePackId tp)
     if (fresh)
     {
         index = int(nodes.size());
-        if (FFlag::LuauEmplaceNotPushBack)
-            nodes.emplace_back(nullptr, tp, false, false, index);
-        else
-            nodes.push_back({nullptr, tp, false, false, index});
+        nodes.emplace_back(nullptr, tp, false, false, index);
     }
 
     return {index, fresh};
@@ -392,12 +410,7 @@ TarjanResult Tarjan::loop()
             {
                 // Original recursion point, update the parent continuation point and start the new element
                 worklist.back() = {index, currEdge + 1, lastEdge};
-                if (FFlag::LuauEmplaceNotPushBack)
-                    worklist.emplace_back(childIndex, -1, -1);
-                else
-                    worklist.push_back({childIndex, -1, -1});
-
-                // We need to continue the top-level loop from the start with the new worklist element
+                worklist.emplace_back(childIndex, -1, -1); // We need to continue the top-level loop from the start with the new worklist element
                 foundFresh = true;
                 break;
             }
@@ -453,10 +466,7 @@ TarjanResult Tarjan::visitRoot(TypeId ty)
     ty = log->follow(ty);
 
     auto [index, fresh] = indexify(ty);
-    if (FFlag::LuauEmplaceNotPushBack)
-        worklist.emplace_back(index, -1, -1);
-    else
-        worklist.push_back({index, -1, -1});
+    worklist.emplace_back(index, -1, -1);
     return loop();
 }
 
@@ -469,10 +479,7 @@ TarjanResult Tarjan::visitRoot(TypePackId tp)
     tp = log->follow(tp);
 
     auto [index, fresh] = indexify(tp);
-    if (FFlag::LuauEmplaceNotPushBack)
-        worklist.emplace_back(index, -1, -1);
-    else
-        worklist.push_back({index, -1, -1});
+    worklist.emplace_back(index, -1, -1);
     return loop();
 }
 
@@ -846,15 +853,10 @@ void Substitution::replaceChildren(TypeId ty)
     {
         for (auto& [name, prop] : etv->props)
         {
-            if (FFlag::LuauSolverV2)
-            {
-                if (prop.readTy)
-                    prop.readTy = replace(prop.readTy);
-                if (prop.writeTy)
-                    prop.writeTy = replace(prop.writeTy);
-            }
-            else
-                prop.setType(replace(prop.type_DEPRECATED()));
+            if (prop.readTy)
+                prop.readTy = replace(prop.readTy);
+            if (prop.writeTy)
+                prop.writeTy = replace(prop.writeTy);
         }
 
         if (etv->parent)
@@ -868,10 +870,32 @@ void Substitution::replaceChildren(TypeId ty)
             etv->indexer->indexType = replace(etv->indexer->indexType);
             etv->indexer->indexResultType = replace(etv->indexer->indexResultType);
         }
+
+        if (FFlag::DebugLuauUserDefinedClasses && etv->relation)
+        {
+            Luau::visit(
+                overloaded{
+                    [&](Obj& obj)
+                    {
+                        obj.ty = replace(obj.ty);
+                    },
+                    [&](Klass& klass)
+                    {
+                        klass.ty = replace(klass.ty);
+                    }
+                },
+                *etv->relation
+            );
+        }
     }
     else if (NegationType* ntv = getMutable<NegationType>(ty))
     {
         ntv->ty = replace(ntv->ty);
+    }
+    else if (ErrorType* err = getMutable<ErrorType>(ty); FFlag::LuauReduceTypeFunctionToSyntheticError && err)
+    {
+        LUAU_ASSERT(ty->persistent || err->synthetic);
+        err->synthetic = replace(err->synthetic);
     }
 }
 

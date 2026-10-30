@@ -13,17 +13,14 @@
 
 #include <optional>
 
-LUAU_FASTFLAG(LuauEmplaceNotPushBack)
-
-
 namespace Luau
 {
 struct InstanceCollector2 : TypeOnceVisitor
 {
     VecDeque<TypeId> tys;
     VecDeque<TypePackId> tps;
-    DenseHashSet<TypeId> cyclicInstance{nullptr};
-    DenseHashSet<TypeId> instanceArguments{nullptr};
+    DenseHashSet<TypeId> cyclicInstance;
+    DenseHashSet<TypeId> instanceArguments;
 
     InstanceCollector2()
         : TypeOnceVisitor("InstanceCollector2", /* skipBoundTypes */ true)
@@ -170,10 +167,7 @@ TypeFunctionReductionGuessResult TypeFunctionReductionGuesser::guessTypeFunction
         if (get<TypeFunctionInstanceType>(guess))
             continue;
 
-        if (FFlag::LuauEmplaceNotPushBack)
-            results.emplace_back(local->name.value, guess);
-        else
-            results.push_back({local->name.value, guess});
+        results.emplace_back(local->name.value, guess);
     }
 
     // Submit a guess for return types

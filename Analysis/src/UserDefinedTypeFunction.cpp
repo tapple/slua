@@ -1,16 +1,19 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 
 #include "Luau/ApplyTypeFunction.h"
-#include "Luau/BuiltinTypeFunctions.h"
 #include "Luau/ConstraintSolver.h"
+#include "Luau/IterativeTypeFunctionTypeVisitor.h"
 #include "Luau/Normalize.h"
 #include "Luau/StringUtils.h"
 #include "Luau/TimeTrace.h"
+#include "Luau/TypeFunctionError.h"
 #include "Luau/UserDefinedTypeFunction.h"
 #include "Luau/VisitType.h"
 
 #include "lua.h"
 #include "lualib.h"
+
+LUAU_FASTFLAGVARIABLE(LuauTypeFunctionsReturnAfterAllSerialized)
 
 namespace Luau
 {
@@ -44,7 +47,7 @@ private:
 struct FindUserTypeFunctionBlockers : TypeOnceVisitor
 {
     NotNull<TypeFunctionContext> ctx;
-    DenseHashSet<TypeId> blockingTypeMap{nullptr};
+    DenseHashSet<TypeId> blockingTypeMap;
     std::vector<TypeId> blockingTypes;
 
     explicit FindUserTypeFunctionBlockers(NotNull<TypeFunctionContext> ctx)
@@ -74,6 +77,20 @@ struct FindUserTypeFunctionBlockers : TypeOnceVisitor
     bool visit(TypeId ty, const ExternType&) override
     {
         return false;
+    }
+};
+
+struct FreezeTypeFunctionTypes : IterativeTypeFunctionTypeVisitor
+{
+    FreezeTypeFunctionTypes()
+        : IterativeTypeFunctionTypeVisitor("FreezeTypeFunctionTypes")
+    {
+    }
+
+    bool visit(TypeFunctionTypeId ty) override
+    {
+        const_cast<TypeFunctionType*>(ty)->frozen = true;
+        return true;
     }
 };
 
@@ -162,9 +179,15 @@ static int evaluateTypeAliasCall(lua_State* L)
     TypeFunctionTypeId serializedTy = serialize(follow(target), runtimeBuilder);
 
     if (!runtimeBuilder->errors.empty())
-        luaL_error(L, "%s", runtimeBuilder->errors.front().c_str());
+        luaL_error(L, "%s", toString(runtimeBuilder->errors.front()).c_str());
 
-    allocTypeUserData(L, serializedTy->type);
+    if (!serializedTy)
+        luaL_error(L, "Complexity limit reached when passing a type to a type alias");
+
+    FreezeTypeFunctionTypes freezer{};
+    freezer.run(serializedTy);
+
+    allocTypeUserData(L, serializedTy->type, /* frozen */ true);
     return 1;
 }
 
@@ -176,6 +199,7 @@ TypeFunctionReductionResult<TypeId> userDefinedTypeFunction(
 )
 {
     auto typeFunction = getMutable<TypeFunctionInstanceType>(instance);
+    LUAU_ASSERT(typeFunction);
 
     if (typeFunction->userFuncData.owner.expired())
     {
@@ -215,7 +239,8 @@ TypeFunctionReductionResult<TypeId> userDefinedTypeFunction(
         if (definition.first->hasErrors)
             return {ctx->builtins->errorType, Reduction::MaybeOk, {}, {}};
 
-        if (std::optional<std::string> error = ctx->typeFunctionRuntime->registerFunction(definition.first))
+        bool registrationFailed = ctx->typeFunctionRuntime->registerFunction(definition.first).has_value();
+        if (registrationFailed)
         {
             // Failure to register at this point means that original definition had to error out and should not have been present in the
             // environment
@@ -291,9 +316,12 @@ TypeFunctionReductionResult<TypeId> userDefinedTypeFunction(
                     TypeFunctionTypeId serializedTy = serialize(ty, runtimeBuilder.get());
 
                     // Only register aliases that are representable in type environment
-                    if (runtimeBuilder->errors.empty())
+                    if (serializedTy && runtimeBuilder->errors.empty())
                     {
-                        allocTypeUserData(L, serializedTy->type);
+                        FreezeTypeFunctionTypes freezer{};
+                        freezer.run(serializedTy);
+
+                        allocTypeUserData(L, serializedTy->type, /* frozen */ true);
                         lua_setfield(L, -2, name.c_str());
                     }
                 }
@@ -322,6 +350,13 @@ TypeFunctionReductionResult<TypeId> userDefinedTypeFunction(
 
     resetTypeFunctionState(L);
 
+    if (FFlag::LuauTypeFunctionsReturnAfterAllSerialized)
+    {
+        // If something in our environment failed to serialize, return an error.
+        if (!runtimeBuilder->errors.empty())
+            return {std::nullopt, Reduction::Erroneous, {}, {}, toString(runtimeBuilder->errors.front())};
+    }
+
     // Push serialized arguments onto the stack
     for (auto typeParam : typeParams)
     {
@@ -330,12 +365,17 @@ TypeFunctionReductionResult<TypeId> userDefinedTypeFunction(
         LUAU_ASSERT(!isPending(ty, ctx->solver));
 
         TypeFunctionTypeId serializedTy = serialize(ty, runtimeBuilder.get());
-        // Check if there were any errors while serializing
-        if (runtimeBuilder->errors.size() != 0)
-            return {std::nullopt, Reduction::Erroneous, {}, {}, runtimeBuilder->errors.front()};
+
+        // Check if there were any more errors while serializing.
+        if (!runtimeBuilder->errors.empty())
+            return {std::nullopt, Reduction::Erroneous, {}, {}, toString(runtimeBuilder->errors.front())};
+
+        if (!serializedTy)
+            return {std::nullopt, Reduction::Erroneous, {}, {}, "Complexity limit reached when passing a type to a type function"};
 
         allocTypeUserData(L, serializedTy->type);
     }
+
 
     // Set up an interrupt handler for type functions to respect type checking limits and LSP cancellation requests.
     lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
@@ -351,7 +391,7 @@ TypeFunctionReductionResult<TypeId> userDefinedTypeFunction(
     ctx->typeFunctionRuntime->messages.clear();
 
     if (auto error = checkResultForError(L, name.value, lua_pcall(L, int(typeParams.size()), 1, 0)))
-        return {std::nullopt, Reduction::Erroneous, {}, {}, std::move(error), ctx->typeFunctionRuntime->messages};
+        return {std::nullopt, Reduction::Erroneous, {}, {}, toString(*error), ctx->typeFunctionRuntime->messages};
 
     // If the return value is not a type userdata, return with error message
     if (!isTypeUserData(L, 1))
@@ -369,13 +409,13 @@ TypeFunctionReductionResult<TypeId> userDefinedTypeFunction(
     TypeFunctionTypeId retTypeFunctionTypeId = getTypeUserData(L, 1);
 
     // No errors should be present here since we should've returned already if any were raised during serialization.
-    LUAU_ASSERT(runtimeBuilder->errors.size() == 0);
+    LUAU_ASSERT(runtimeBuilder->errors.empty());
 
     TypeId retTypeId = deserialize(retTypeFunctionTypeId, runtimeBuilder.get());
 
     // At least 1 error occurred while deserializing
-    if (runtimeBuilder->errors.size() > 0)
-        return {std::nullopt, Reduction::Erroneous, {}, {}, runtimeBuilder->errors.front(), ctx->typeFunctionRuntime->messages};
+    if (!runtimeBuilder->errors.empty())
+        return {std::nullopt, Reduction::Erroneous, {}, {}, toString(runtimeBuilder->errors.front()), ctx->typeFunctionRuntime->messages};
 
     return {retTypeId, Reduction::MaybeOk, {}, {}, std::nullopt, ctx->typeFunctionRuntime->messages};
 }

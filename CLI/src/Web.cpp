@@ -15,8 +15,7 @@
 #include <string.h>
 
 // Simple FileResolver for type checking on luau.org/demo
-struct DemoFileResolver
-    : Luau::FileResolver
+struct DemoFileResolver : Luau::FileResolver
 {
     std::optional<Luau::SourceCode> readSource(const Luau::ModuleName& name) override
     {
@@ -120,7 +119,7 @@ static std::string runCode(lua_State* L, const std::string& source)
         return error;
     }
 
-    lua_setmemcat(L, 2);
+    lua_setmemcat(L, LUA_FIRST_USER_MEMCAT);
     lua_State* T = lua_newthread(L);
     lua_setmemcat(L, 0);
 
@@ -186,8 +185,7 @@ extern "C" const char* checkScript(const char* source, int useNewSolver)
         DemoConfigResolver configResolver;
         Luau::FrontendOptions options;
 
-        Luau::Frontend frontend(&fileResolver, &configResolver, options);
-        frontend.setLuauSolverMode(useNewSolver ? Luau::SolverMode::New : Luau::SolverMode::Old);
+        Luau::Frontend frontend(useNewSolver ? Luau::SolverMode::New : Luau::SolverMode::Old, &fileResolver, &configResolver, options);
         // Add Luau builtins
         Luau::unfreeze(frontend.globals.globalTypes);
         Luau::registerBuiltinGlobals(frontend, frontend.globals);

@@ -24,9 +24,19 @@ assert(quaternion.conjugate(quat) == quaternion(-quat.x, -quat.y, -quat.z, quat.
 assert(`{quaternion.slerp(yaw_ninety, quaternion(0, 0, 0, 1), 0.5)}` == "<0, 0, 0.382683, 0.92388>")
 
 -- string cast to deal with precision
-assert(`{quaternion.tofwd(yaw_ninety)}` == "<0, 1, 0>")
-assert(`{quaternion.toleft(yaw_ninety)}` == "<-1, 0, 0>")
-assert(`{quaternion.toup(yaw_ninety)}` == "<0, 0, 1>")
+assert(`{ll.Rot2Fwd(yaw_ninety)}` == "<0, 1, 0>")
+assert(`{ll.Rot2Left(yaw_ninety)}` == "<-1, 0, 0>")
+assert(`{ll.Rot2Up(yaw_ninety)}` == "<0, 0, 1>")
+
+-- Zero quaternion normalizes to identity before rotation (matches server)
+assert(`{ll.Rot2Fwd(quaternion(0, 0, 0, 0))}` == "<1, 0, 0>")
+assert(`{ll.Rot2Left(quaternion(0, 0, 0, 0))}` == "<0, 1, 0>")
+assert(`{ll.Rot2Up(quaternion(0, 0, 0, 0))}` == "<0, 0, 1>")
+
+-- Test that tostring doesn't lose precision for large component values
+assert(`{vector(123456.5, 0, 0)}` == "<123456.5, 0, 0>")
+assert(`{vector(1000001, 0, 0)}` == "<1000001, 0, 0>")
+assert(`{quaternion(123456.5, 0, 0, 1)}` == "<123456.5, 0, 0, 1>")
 
 -- Check rotation module has same implementation as quaternion module
 for k,_ in quaternion do

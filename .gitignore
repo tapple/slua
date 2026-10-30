@@ -4,17 +4,24 @@
 /cmake/
 /cmake[.-]*/
 /coverage/
+/coverage.info
 /.vs/
 /.vscode/
 /fuzz/luau.pb.*
 /crash-*
 /default.prof*
 /fuzz-*
+/fuzz/corpus
 /luau
 /luau-tests
 /luau-analyze
 /luau-bytecode
 /luau-compile
+/slua
+/slua-tests
+/slua-analyze
+/slua-bytecode
+/slua-compile
 __pycache__
 /stage
 .cache
@@ -23,3 +30,8 @@ __pycache__
 *.rej
 /fuzz/corpus/json/*
 !/fuzz/corpus/json/*.json
+*.code-workspace
+*.tar.bz2
+
+# Golden-test captured outputs for user debugging
+*.output.tmp

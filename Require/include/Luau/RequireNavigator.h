@@ -13,14 +13,13 @@ struct lua_State;
 
 ////////////////////////////////////////////////////////////////////////////////
 //
-// The RequireNavigator library provides a C++ interface for navigating the
-// context in which require-by-string operates. This is used internally by the
-// require-by-string runtime library to resolve paths based on the rules defined
-// by its consumers.
+// This file provides a C++ interface for navigating the context in which
+// require-by-string operates. This is used internally by the require-by-string
+// runtime library to resolve paths based on the rules defined by its consumers.
 //
-// Directly linking against this library allows for inspection of the
-// require-by-string path resolution algorithm's behavior without enabling the
-// runtime library, which is useful for static tooling as well.
+// Including this file directly allows for inspection of the require-by-string
+// path resolution algorithm's behavior without enabling the runtime library,
+// which can be useful for static tooling.
 //
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -50,7 +49,6 @@ class NavigationContext
 {
 public:
     virtual ~NavigationContext() = default;
-    virtual std::string getRequirerIdentifier() const = 0;
 
     enum class NavigateResult
     {
@@ -59,8 +57,13 @@ public:
         NotFound
     };
 
-    virtual NavigateResult reset(const std::string& identifier) = 0;
+    virtual NavigateResult resetToRequirer() = 0;
     virtual NavigateResult jumpToAlias(const std::string& path) = 0;
+
+    virtual NavigateResult toAliasOverride(const std::string& aliasUnprefixed)
+    {
+        return NavigateResult::NotFound;
+    };
     virtual NavigateResult toAliasFallback(const std::string& aliasUnprefixed)
     {
         return NavigateResult::NotFound;
@@ -80,19 +83,32 @@ public:
         Absent,
         Ambiguous,
         PresentJson,
-        PresentLuau
+        PresentLuau,
+        PresentLuauBytecode
     };
 
-    virtual ConfigStatus getConfigStatus() const = 0;
+    virtual ConfigStatus getConfigStatus() const
+    {
+        return ConfigStatus::Absent;
+    }
 
     std::function<void(lua_State*)> luauConfigInit = nullptr;
     void (*luauConfigInterrupt)(lua_State* L, int gc) = nullptr;
 
     // The result of getConfigBehavior determines whether getAlias or getConfig
     // is called when getConfigStatus indicates a configuration is present.
-    virtual ConfigBehavior getConfigBehavior() const = 0;
-    virtual std::optional<std::string> getAlias(const std::string& alias) const = 0;
-    virtual std::optional<std::string> getConfig() const = 0;
+    virtual ConfigBehavior getConfigBehavior() const
+    {
+        return ConfigBehavior::GetAlias;
+    }
+    virtual std::optional<std::string> getAlias(const std::string& alias)
+    {
+        return std::nullopt;
+    }
+    virtual std::optional<std::string> getConfig() const
+    {
+        return std::nullopt;
+    }
 };
 
 // The Navigator class is responsible for traversing a given require path in the
@@ -123,12 +139,12 @@ private:
     [[nodiscard]] Error jumpToAlias(const std::string& aliasPath);
     [[nodiscard]] Error navigateToParent(std::optional<std::string> previousComponent);
     [[nodiscard]] Error navigateToChild(const std::string& component);
+
+    [[nodiscard]] std::pair<Error, bool> toAliasOverride(const std::string& aliasUnprefixed);
     [[nodiscard]] Error toAliasFallback(const std::string& aliasUnprefixed);
 
     NavigationContext& navigationContext;
     ErrorHandler& errorHandler;
-
-    std::optional<std::string> foundAliasValue;
 };
 
 } // namespace Luau::Require

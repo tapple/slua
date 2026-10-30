@@ -2,6 +2,7 @@
 #include "Luau/Common.h"
 #include "Luau/ExperimentalFlags.h"
 
+#include <string>
 #include <string_view>
 
 #include <stdio.h>
@@ -16,6 +17,14 @@ static void setLuauFlag(std::string_view name, bool state)
             flag->value = state;
             return;
         }
+        if (flag->version != 0)
+        {
+            if (name == std::string(flag->name) + std::to_string(flag->version))
+            {
+                flag->value = state;
+                return;
+            }
+        }
     }
 
     fprintf(stderr, "Warning: unrecognized flag '%.*s'.\n", int(name.length()), name.data());
@@ -23,8 +32,9 @@ static void setLuauFlag(std::string_view name, bool state)
 
 static void setLuauFlags(bool state)
 {
+    // ServerLua: include our flags too.
     for (Luau::FValue<bool>* flag = Luau::FValue<bool>::list; flag; flag = flag->next)
-        if (strncmp(flag->name, "Luau", 4) == 0)
+        if (strncmp(flag->name, "Luau", 4) == 0 || strncmp(flag->name, "SLua", 4) == 0)
             flag->value = state;
 }
 

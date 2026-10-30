@@ -11,45 +11,122 @@
 #include "ludata.h"
 #include "lbuffer.h"
 #include "llsl.h"
+#include "lstrbuf.h"
 
 #include <algorithm>
 #include <string.h>
 
 #include <unordered_set>
-#include <queue>
+#include <vector>
+#include <utility>
+
+LUAU_FASTFLAGVARIABLE(SLuaEagerWeakClear)
+
+// Nothing below knows about heap-allocated vectors
+static_assert(LUA_VECTOR_DOUBLE == 0, "the reachability walk has no LUA_TVECTOR case");
+
+static constexpr uint8_t kWeakKey = 1 << 0;
+static constexpr uint8_t kWeakValue = 1 << 1;
+
+// Starting capacity for the walk's scratch vectors. Reserving up front keeps a
+// walk to roughly one allocation per vector, where allocations were previously
+// a big chunk of runtime for large graphs.
+static constexpr size_t kWalkReserve = 1024;
 
 // Helper functions to traverse child objects for reachable user alloc traversal
 typedef struct ReachableContext
 {
-    std::queue<GCObject*> queue;
-    std::unordered_set<void*> visited;
+    // DFS stack of objects still to traverse.
+    std::vector<GCObject*> worklist;
+    // Every object we set WALKBIT on this walk, so it can be cleared before we
+    // return.
+    std::vector<GCObject*> marked;
+    global_State* global = nullptr;
+    // Only a walk rooted at an instance, which is what having a baseline set
+    // means, defers weak sides: anywhere else "unreached" doesn't mean "dead".
+    // The baseline snapshot itself keeps fully-strong traversal so the
+    // exemption set is maximal.
+    bool defer_weak = false;
+    // Weak tables seen during the walk, with their weakness bits, for the
+    // post-walk clear pass.
+    std::vector<std::pair<LuaTable*, uint8_t>> weak_tables;
+
+    // Exception-safe way to ensure WALKBIT never persists beyond the scope of
+    // our traversal.
+    ~ReachableContext()
+    {
+        for (GCObject* obj : marked)
+            resetbit(obj->gch.marked, WALKBIT);
+    }
 } ReachableContext;
+
+static inline bool mark_seen(ReachableContext* ctx, GCObject* obj)
+{
+    if (testbit(obj->gch.marked, WALKBIT))
+        return false;
+    // Record before marking so a throwing push_back never strands a set bit.
+    ctx->marked.push_back(obj);
+    l_setbit(obj->gch.marked, WALKBIT);
+    return true;
+}
 
 static void enqueueobj(ReachableContext* ctx, GCObject* obj)
 {
     // Note that this is strictly for _user_ allocations that we haven't seen before!
-    if (!obj)
+    if (LUAU_UNLIKELY(!obj))
         return;
 
     // We allow traversing threads even if they have a system memcat so long as their _active_
     // memcat is a user memcat.
-    bool eligible_thread = (obj->gch.tt == LUA_TTHREAD && gco2th(obj)->activememcat >= 2);
-    if ((eligible_thread || obj->gch.memcat >= 2) && ctx->visited.insert(obj).second)
+    bool eligible_thread = (obj->gch.tt == LUA_TTHREAD && gco2th(obj)->activememcat >= LUA_FIRST_USER_MEMCAT);
+    if ((eligible_thread || obj->gch.memcat >= LUA_FIRST_USER_MEMCAT) && mark_seen(ctx, obj))
     {
-        ctx->queue.push(obj);
+        ctx->worklist.push_back(obj);
     }
+}
+
+// For typed object pointers. obj2gco() reads the object when asserts are on, so the null
+// check has to come first.
+#define enqueueref(ctx, o) do { auto* enqueueref_ptr = (o); if (enqueueref_ptr) enqueueobj(ctx, obj2gco(enqueueref_ptr)); } while (0)
+
+// Strings and UUIDs act as values in user weak tables (see isobjcleared in
+// lgc.cpp): they keep their entries alive and stay charged.
+static bool hasweakvaluesemantics(GCObject* o)
+{
+    return o->gch.tt == LUA_TSTRING || (o->gch.tt == LUA_TUSERDATA && gco2u(o)->tag == UTAG_UUID);
 }
 
 static void traversetable(ReachableContext* ctx, LuaTable* h)
 {
+    // luaH_setreadonly() only builds metamethod caches for system tables, so
+    // neither the sizing nor the weak clear below account for one.
+    LUAU_ASSERT(!hasmetacache(h));
+
     // Traverse metatable
-    if (h->metatable)
-        enqueueobj(ctx, obj2gco(h->metatable));
+    enqueueref(ctx, h->metatable);
+
+    // Weak sides of weak tables are deferred to the post-walk clear pass, so
+    // objects reachable only through them are neither charged nor kept.
+    // Fixed tables may be shared across forked instances and must never be
+    // mutated, so they keep fully-strong traversal.
+    uint8_t weakbits = 0;
+    if (ctx->defer_weak && !isfixed(obj2gco(h)))
+    {
+        if (const char* modev = luaC_gettablemode(ctx->global, h))
+        {
+            if (strchr(modev, 'k'))
+                weakbits |= kWeakKey;
+            if (strchr(modev, 'v'))
+                weakbits |= kWeakValue;
+            if (weakbits)
+                ctx->weak_tables.push_back({h, weakbits});
+        }
+    }
 
     // Traverse array elements
     for (int i = 0; i < h->sizearray; ++i)
     {
-        if (iscollectable(&h->array[i]))
+        if (iscollectable(&h->array[i]) && (!(weakbits & kWeakValue) || hasweakvaluesemantics(gcvalue(&h->array[i]))))
             enqueueobj(ctx, gcvalue(&h->array[i]));
     }
 
@@ -65,10 +142,10 @@ static void traversetable(ReachableContext* ctx, LuaTable* h)
             if (!ttisnil(&n.val))
             {
                 // Traverse key
-                if (iscollectable(&n.key))
+                if (iscollectable(&n.key) && (!(weakbits & kWeakKey) || hasweakvaluesemantics(gcvalue(&n.key))))
                     enqueueobj(ctx, gcvalue(&n.key));
                 // Traverse value
-                if (iscollectable(&n.val))
+                if (iscollectable(&n.val) && (!(weakbits & kWeakValue) || hasweakvaluesemantics(gcvalue(&n.val))))
                     enqueueobj(ctx, gcvalue(&n.val));
             }
         }
@@ -78,7 +155,7 @@ static void traversetable(ReachableContext* ctx, LuaTable* h)
 static void traverseclosure(ReachableContext* ctx, Closure* cl)
 {
     // Traverse environment
-    enqueueobj(ctx, obj2gco(cl->env));
+    enqueueref(ctx, cl->env);
 
     if (cl->isC)
     {
@@ -92,7 +169,7 @@ static void traverseclosure(ReachableContext* ctx, Closure* cl)
     else
     {
         // Traverse proto
-        enqueueobj(ctx, obj2gco(cl->l.p));
+        enqueueref(ctx, cl->l.p);
 
         // Traverse Lua closure upvalues
         for (int i = 0; i < cl->nupvalues; ++i)
@@ -106,20 +183,19 @@ static void traverseclosure(ReachableContext* ctx, Closure* cl)
 static void traverseudata(ReachableContext* ctx, Udata* u)
 {
     // Traverse metatable
-    if (u->metatable)
-        enqueueobj(ctx, obj2gco(u->metatable));
+    enqueueref(ctx, u->metatable);
 
     // Traverse any internal references udatas might have, if applicable.
     switch(u->tag)
     {
         case UTAG_LLEVENTS:
-            enqueueobj(ctx, obj2gco(((lua_LLEvents*)&u->data)->listeners_tab));
+            enqueueref(ctx, ((lua_LLEvents*)&u->data)->handlers_tab);
             break;
         case UTAG_LLTIMERS:
-            enqueueobj(ctx, obj2gco(((lua_LLTimers*)&u->data)->timers_tab));
+            enqueueref(ctx, ((lua_LLTimers*)&u->data)->timers_tab);
             break;
         case UTAG_UUID:
-            enqueueobj(ctx, obj2gco(((lua_LSLUUID*)&u->data)->str));
+            enqueueref(ctx, ((lua_LSLUUID*)&u->data)->str);
             break;
         default:
             break;
@@ -129,7 +205,7 @@ static void traverseudata(ReachableContext* ctx, Udata* u)
 static void traversethread(ReachableContext* ctx, lua_State* th)
 {
     // Traverse globals table
-    enqueueobj(ctx, obj2gco(th->gt));
+    enqueueref(ctx, th->gt);
 
     // We don't traverse th->namecall, it's not a user alloc anyway.
 
@@ -142,18 +218,19 @@ static void traversethread(ReachableContext* ctx, lua_State* th)
 
     // Traverse open upvalues
     for (UpVal* uv = th->openupval; uv; uv = uv->u.open.threadnext)
-        enqueueobj(ctx, obj2gco(uv));
+        enqueueref(ctx, uv);
+
+    // Traverse pending coroutine.finally() callbacks
+    enqueueref(ctx, th->finalizers);
 }
 
 static void traverseproto(ReachableContext* ctx, Proto* p)
 {
     // Traverse source string
-    if (p->source)
-        enqueueobj(ctx, obj2gco(p->source));
+    enqueueref(ctx, p->source);
 
     // Traverse debug name string
-    if (p->debugname)
-        enqueueobj(ctx, obj2gco(p->debugname));
+    enqueueref(ctx, p->debugname);
 
     // Traverse constants
     for (int i = 0; i < p->sizek; ++i)
@@ -164,24 +241,15 @@ static void traverseproto(ReachableContext* ctx, Proto* p)
 
     // Traverse upvalue names
     for (int i = 0; i < p->sizeupvalues; ++i)
-    {
-        if (p->upvalues[i])
-            enqueueobj(ctx, obj2gco(p->upvalues[i]));
-    }
+        enqueueref(ctx, p->upvalues[i]);
 
     // Traverse sub-protos
     for (int i = 0; i < p->sizep; ++i)
-    {
-        if (p->p[i])
-            enqueueobj(ctx, obj2gco(p->p[i]));
-    }
+        enqueueref(ctx, p->p[i]);
 
     // Traverse local variable names
     for (int i = 0; i < p->sizelocvars; ++i)
-    {
-        if (p->locvars[i].varname)
-            enqueueobj(ctx, obj2gco(p->locvars[i].varname));
-    }
+        enqueueref(ctx, p->locvars[i].varname);
 }
 
 static void traverseupval(ReachableContext* ctx, UpVal* uv)
@@ -189,6 +257,38 @@ static void traverseupval(ReachableContext* ctx, UpVal* uv)
     // Traverse referenced value
     if (iscollectable(uv->v))
         enqueueobj(ctx, gcvalue(uv->v));
+}
+
+// Mirrors traverseclass in lgc.cpp
+static void traverseclass(ReachableContext* ctx, LuauClass* lco)
+{
+    enqueueref(ctx, lco->name);
+    enqueueref(ctx, lco->super);
+    enqueueref(ctx, lco->memberstooffset);
+
+    for (uint32_t i = 0; i < lco->numberofallmembers; ++i)
+        enqueueref(ctx, lco->offsettomember[i]);
+
+    uint32_t numberofstaticmembers = lco->numberofallmembers - lco->numberofinstancemembers;
+    for (uint32_t i = 0; i < numberofstaticmembers; ++i)
+    {
+        if (iscollectable(&lco->staticmembers[i]))
+            enqueueobj(ctx, gcvalue(&lco->staticmembers[i]));
+    }
+
+    enqueueref(ctx, lco->instancemetatable);
+}
+
+// Mirrors traverseobject in lgc.cpp
+static void traverseobject(ReachableContext* ctx, LuauObject* inst)
+{
+    enqueueref(ctx, inst->lclass);
+
+    for (uint32_t i = 0; i < inst->numberofmembers; ++i)
+    {
+        if (iscollectable(&inst->members[i]))
+            enqueueobj(ctx, gcvalue(&inst->members[i]));
+    }
 }
 
 static void traverseobj(ReachableContext* ctx, GCObject* o)
@@ -226,6 +326,14 @@ static void traverseobj(ReachableContext* ctx, GCObject* o)
 
     case LUA_TUPVAL:
         traverseupval(ctx, gco2uv(o));
+        break;
+
+    case LUA_TCLASS:
+        traverseclass(ctx, gco2class(o));
+        break;
+
+    case LUA_TOBJECT:
+        traverseobject(ctx, gco2object(o));
         break;
 
     default:
@@ -271,6 +379,15 @@ static size_t calctruegcosize(GCObject *obj)
     }
     case LUA_TUPVAL:
         return sizeof(UpVal);
+    case LUA_TCLASS:
+    {
+        LuauClass* lco = gco2class(obj);
+        return sizeof(LuauClass) +
+               ((lco->numberofallmembers - lco->numberofinstancemembers) * sizeof(TValue)) +
+               (lco->numberofallmembers * sizeof(TString*));
+    }
+    case LUA_TOBJECT:
+        return sizeof(LuauObject) + (gco2object(obj)->numberofmembers * sizeof(TValue));
     default:
         LUAU_ASSERT(!"Unknown object type");
         return 0;
@@ -284,7 +401,7 @@ static size_t calctruegcosize(GCObject *obj)
 // In a lot of ways, the logical size of allocations leaks into the API contract in SL.
 // This isn't ideal, since the sizes of structs and pointers can vary based on padding,
 // the platform, and the bitness of the platform.
-static size_t calcgcosize(GCObject *obj)
+size_t luaC_calclogicalgcosize(GCObject *obj)
 {
     // These are either arbitrary or based on 32-bit x86 sizes.
     constexpr size_t BASE_STRING_COST = 16;
@@ -297,9 +414,13 @@ static size_t calcgcosize(GCObject *obj)
     constexpr size_t LUANODE_COST = TVALUE_COST * 2;
     constexpr size_t POINTER_COST = 4;
     constexpr size_t UPVAL_COST = 24;
+    constexpr size_t BASE_CLASS_COST = 40;
+    constexpr size_t BASE_OBJECT_COST = 20;
 
     // Make sure that these values are sensible. They should not be _more_ than the
     // actual size of these structs on i686.
+    CHECK_GCO_SIZE(BASE_OBJECT_COST, sizeof(LuauObject));
+    CHECK_GCO_SIZE(BASE_CLASS_COST, sizeof(LuauClass));
     CHECK_GCO_SIZE(UPVAL_COST, sizeof(UpVal));
     CHECK_GCO_SIZE(LUANODE_COST, sizeof(LuaNode));
     CHECK_GCO_SIZE(CALLINFO_COST, sizeof(CallInfo));
@@ -342,6 +463,11 @@ static size_t calcgcosize(GCObject *obj)
             return 8;
         case UTAG_LLTIMERS:
             return 8;
+        case UTAG_STRBUF:
+        {
+            const lua_YieldSafeStrBuf* buf = (const lua_YieldSafeStrBuf*)&udata->data;
+            return sizeof(lua_YieldSafeStrBuf) + buf->size;
+        }
         default:
             return sizeudata(udata->len);
         }
@@ -367,9 +493,72 @@ static size_t calcgcosize(GCObject *obj)
     }
     case LUA_TUPVAL:
         return UPVAL_COST;
+    case LUA_TCLASS:
+    {
+        LuauClass* lco = gco2class(obj);
+        return BASE_CLASS_COST +
+               ((lco->numberofallmembers - lco->numberofinstancemembers) * TVALUE_COST) +
+               (lco->numberofallmembers * POINTER_COST);
+    }
+    case LUA_TOBJECT:
+        return BASE_OBJECT_COST + (gco2object(obj)->numberofmembers * TVALUE_COST);
     default:
         LUAU_ASSERT(!"Unknown object type");
         return 0;
+    }
+}
+
+// Mirrors isobjcleared in lgc.cpp, with WALKBIT ("reached during the walk")
+// standing in for mark color. Objects the walker never traverses (system
+// memcats, fixed baseline objects) are conservatively live.
+static bool isweakobjdead(GCObject* o)
+{
+    if (hasweakvaluesemantics(o))
+        return false;
+    if (isfixed(o) || o->gch.memcat < LUA_FIRST_USER_MEMCAT)
+        return false;
+    return !testbit(o->gch.marked, WALKBIT);
+}
+
+#define isweakrefdead(o) (iscollectable(o) && isweakobjdead(gcvalue(o)))
+
+// Clears weak table entries whose referents the walk could not reach, the way
+// cleartable does at the real GC's atomic phase, minus shrinking. Writing
+// nil/DEADKEY never allocates or rehashes and only removes references, so
+// this is safe in any GC phase and never invalidates iterators.
+static void cleardeadweakrefs(ReachableContext* ctx)
+{
+    for (const auto& weak_entry : ctx->weak_tables)
+    {
+        LuaTable* h = weak_entry.first;
+        uint8_t weakbits = weak_entry.second;
+
+        if (weakbits & kWeakValue)
+        {
+            for (int i = 0; i < h->sizearray; ++i)
+            {
+                if (isweakrefdead(&h->array[i]))
+                    setnilvalue(&h->array[i]);
+            }
+        }
+
+        if (h->node == &luaH_dummynode)
+            continue;
+
+        int sizenode = 1 << h->lsizenode;
+        for (int i = 0; i < sizenode; ++i)
+        {
+            LuaNode* n = &h->node[i];
+            if (ttisnil(&n->val))
+                continue;
+            if (((weakbits & kWeakKey) && isweakrefdead(&n->key)) ||
+                ((weakbits & kWeakValue) && isweakrefdead(&n->val)))
+            {
+                setnilvalue(&n->val);
+                if (iscollectable(&n->key))
+                    setttype(&n->key, LUA_TDEADKEY);
+            }
+        }
     }
 }
 
@@ -381,45 +570,71 @@ void luaC_enumreachableuserallocs(
 )
 {
     ReachableContext ctx;
+    ctx.global = L->global;
+    ctx.defer_weak = FFlag::SLuaEagerWeakClear && free_objects != nullptr;
 
-    // Pre-populate visited set with free objects if provided
+    // Make sure we can hold the free objects, as well as the best-guesss max number
+    // of GCObjects we're likely to see during our walk.
+    ctx.marked.reserve((free_objects ? free_objects->size() : 0) + kWalkReserve);
+    ctx.worklist.reserve(kWalkReserve);
+
+    // Seed the baseline as already-seen so the walk prunes at it
     if (free_objects)
-    {
-        ctx.visited = *free_objects;
-    }
+        for (const void* p : *free_objects)
+            mark_seen(&ctx, (GCObject*)p);
 
-    ctx.queue.push(obj2gco(L));
-    ctx.visited.insert(obj2gco(L));
+    // We start walking from the thread root
+    if (mark_seen(&ctx, obj2gco(L)))
+        ctx.worklist.push_back(obj2gco(L));
 
-    while (!ctx.queue.empty())
+    // Objects still being built aren't reachable yet but will be soon, so they're roots too.
+    // Only makes sense when walking the thread that's currently executing.
+    for (const UnrootedAllocTracker* tracker = ctx.global->unrootedallocs; tracker; tracker = tracker->prev)
+        enqueueobj(&ctx, tracker->obj);
+
+    while (!ctx.worklist.empty())
     {
-        GCObject* current = ctx.queue.front();
-        ctx.queue.pop();
+        GCObject* current = ctx.worklist.back();
+        ctx.worklist.pop_back();
 
         // Call the user-provided traversal callback
-        if (current->gch.memcat >= 2)
-            node(context, current, current->gch.tt, current->gch.memcat, calcgcosize(current));
+        if (current->gch.memcat >= LUA_FIRST_USER_MEMCAT)
+            node(context, current, current->gch.tt, current->gch.memcat, luaC_calclogicalgcosize(current));
 
-        // Take any new references the current node has and add them to the queue
+        // Take any new references the current node has and add them to the worklist
         traverseobj(&ctx, current);
     }
+
+    if (ctx.defer_weak)
+        cleardeadweakrefs(&ctx);
 }
 
 lua_OpaqueGCObjectSet luaC_collectfreeobjects(lua_State* L)
 {
     lua_OpaqueGCObjectSet free_objects;
     ReachableContext ctx;
+    ctx.global = L->global;
+    ctx.marked.reserve(kWalkReserve);
+    ctx.worklist.reserve(kWalkReserve);
 
-    ctx.queue.push(obj2gco(L));
-    ctx.visited.insert(obj2gco(L));
+    const auto *gt_gco = obj2gco(L->gt);
 
-    while (!ctx.queue.empty())
+    mark_seen(&ctx, obj2gco(L));
+
+    traverseobj(&ctx, obj2gco(L));
+
+    while (!ctx.worklist.empty())
     {
-        GCObject* current = ctx.queue.front();
-        ctx.queue.pop();
+        GCObject* current = ctx.worklist.back();
+        ctx.worklist.pop_back();
 
-        // Collect memcat 2+ objects into the set
-        if (current->gch.memcat >= 2)
+        // Don't try to mark the globals table for the user's root thread as free,
+        // and don't even bother traversing it
+        if (current == gt_gco)
+            continue;
+
+        // Collect user memcat objects into the set
+        if (current->gch.memcat >= LUA_FIRST_USER_MEMCAT)
             free_objects.insert(current);
 
         // Traverse child references

@@ -1,19 +1,21 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/Repl.h"
 
+#include "Luau/CodeGenOptions.h"
 #include "Luau/Common.h"
 #include "lua.h"
 #include "lualib.h"
+#include "luacode.h"
 
 #include "Luau/CodeGen.h"
 #include "Luau/Compiler.h"
-#include "Luau/LSLBuiltins.h"
 #include "Luau/Parser.h"
 #include "Luau/TimeTrace.h"
-
+#include "Luau/Counters.h"
 #include "Luau/Coverage.h"
 #include "Luau/FileUtils.h"
 #include "Luau/Flags.h"
+#include "Luau/JitInliner.h"
 #include "Luau/Profiler.h"
 #include "Luau/ReplRequirer.h"
 #include "Luau/Require.h"
@@ -41,25 +43,27 @@
 #endif
 
 #include "llsl.h"
-#ifdef LUAU_USE_TAILSLIDE
+#include "Luau/LSLBuiltins.h"
 #include "Luau/LSLCompiler.h"
-#endif
 
 
 #include <locale.h>
 #include <signal.h>
+#include <stdlib.h>
 
 LUAU_FASTFLAG(DebugLuauTimeTracing)
-
 
 constexpr int MaxTraversalLimit = 50;
 
 static bool codegen = false;
+static bool codegenCold = false;
+
 static bool lsl = false;
 static bool sl = false;
 static bool builtinsLoaded = false;
 static lua_SLRuntimeState lsl_state;
 
+static bool jitInliner = false;
 static int program_argc = 0;
 char** program_argv = nullptr;
 
@@ -84,6 +88,11 @@ static void sigintCallback(lua_State* L, int gc)
 }
 
 static lua_State* replState = NULL;
+// ServerLua: For our fake memory tracking stuff, note that this might not
+//  be 100% representative of prod behavior, especially around `require()`
+//  and its memory side-effects.
+static lua_OpaqueGCObjectSet replFreeObjects;
+static size_t replBytecodeSize = 0;
 
 #ifdef _WIN32
 BOOL WINAPI sigintHandler(DWORD signal)
@@ -175,6 +184,26 @@ static int lua_collectgarbage(lua_State* L)
     luaL_error(L, "collectgarbage must be called with 'count' or 'collect'");
 }
 
+static int lua_graphheap_wrapper(lua_State* L)
+{
+    const char* path = luaL_checkstring(L, 1);
+    lua_graphheap(replState, path);
+    return 0;
+}
+
+static int lua_graphuserheap_wrapper(lua_State* L)
+{
+    const char* path = luaL_checkstring(L, 1);
+    lua_graphuserheap(replState, path, &replFreeObjects);
+    return 0;
+}
+
+static int lua_getusedmemory_wrapper(lua_State* L)
+{
+    luaSL_pushnativeinteger(L, (int)(lua_userthreadgc(replState, &replFreeObjects) + replBytecodeSize));
+    return 1;
+}
+
 #ifdef CALLGRIND
 static int lua_callgrind(lua_State* L)
 {
@@ -210,7 +239,7 @@ void* createCliRequireContext(lua_State* L)
     void* ctx = lua_newuserdatadtor(
         L,
         sizeof(ReplRequirer),
-        [](void* ptr)
+        [](lua_State*, void* ptr)
         {
             static_cast<ReplRequirer*>(ptr)->~ReplRequirer();
         }
@@ -230,6 +259,8 @@ void* createCliRequireContext(lua_State* L)
             return codegen;
         },
         coverageTrack,
+        countersActive,
+        countersTrack
     };
 
     // Store ReplRequirer in the registry to keep it alive for the lifetime of
@@ -245,6 +276,9 @@ void setupState(lua_State* L)
 {
     if (codegen)
         Luau::CodeGen::create(L);
+
+    if (jitInliner)
+        Luau::JitInliner::setup(L);
 
     luaL_openlibs(L);
 
@@ -265,6 +299,11 @@ void setupState(lua_State* L)
         }
         luaopen_ll(L, true);
         lua_pop(L, 1);
+
+        lua_getglobal(L, "ll");
+        lua_pushcfunction(L, lua_getusedmemory_wrapper, "ll.GetUsedMemory");
+        lua_setfield(L, -2, "GetUsedMemory");
+        lua_pop(L, 1);
         // Set the builtin constants on _G if we have any.
         luaSL_set_constant_globals(L);
     }
@@ -279,6 +318,8 @@ void setupState(lua_State* L)
     static const luaL_Reg funcs[] = {
         {"loadstring", lua_loadstring},
         {"collectgarbage", lua_collectgarbage},
+        {"graphheap", lua_graphheap_wrapper},
+        {"graphuserheap", lua_graphuserheap_wrapper},
 #ifdef CALLGRIND
         {"callgrind", lua_callgrind},
 #endif
@@ -298,16 +339,12 @@ void setupState(lua_State* L)
 
 void setupArguments(lua_State* L, int argc, char** argv)
 {
-    lua_checkstack(L, argc);
-
     for (int i = 0; i < argc; ++i)
         lua_pushstring(L, argv[i]);
 }
 
 std::string runCode(lua_State* L, const std::string& source)
 {
-    lua_checkstack(L, LUA_MINSTACK);
-
     std::string bytecode = Luau::compile(source, copts());
 
     if (luau_load(L, "=stdin", bytecode.data(), bytecode.size(), 0) != 0)
@@ -483,8 +520,6 @@ static void completeIndexer(lua_State* L, const std::string& editBuffer, const A
     std::string_view lookup = editBuffer;
     bool completeOnlyFunctions = false;
 
-    lua_checkstack(L, LUA_MINSTACK);
-
     // Push the global variable table to begin the search
     lua_pushvalue(L, LUA_GLOBALSINDEX);
 
@@ -649,36 +684,44 @@ static void runRepl()
     runReplImpl(L);
 }
 
+static std::string getFilePath(const char* name)
+{
+    if (isFile(name))
+        return name;
+
+    std::string base = name;
+
+    std::string luauPath = base + ".luau";
+    if (isFile(luauPath))
+        return luauPath;
+
+    std::string luaPath = base + ".lua";
+    if (isFile(luaPath))
+        return luaPath;
+
+    return "";
+}
+
 // `repl` is used it indicate if a repl should be started after executing the file.
 static bool runFile(const char* name, lua_State* GL, bool repl)
 {
-    std::optional<std::string> source = readFile(name);
+    std::optional<std::string> source = readFile(getFilePath(name));
     if (!source)
     {
         fprintf(stderr, "Error opening %s\n", name);
         return false;
     }
 
-    lua_setmemcat(GL, 2);
+    lua_setmemcat(GL, LUA_FIRST_USER_MEMCAT);
 
     // module needs to run in a new thread, isolated from the rest
     lua_State* L = lua_newthread(GL);
+    replState = L;
 
     lua_setmemcat(GL, 0);
 
     // new thread needs to have the globals sandboxed
     luaL_sandboxthread(L);
-
-    if (sl)
-    {
-        luaSL_createeventmanager(L);
-        lua_ref(L, -1);
-        lua_pushvalue(L, -1);
-        lua_setglobal(L, "LLEvents");
-        luaSL_createtimermanager(L);
-        lua_ref(L, -1);
-        lua_setglobal(L, "LLTimers");
-    }
 
     std::string chunkname = "@" + normalizePath(name);
 
@@ -687,13 +730,8 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
     const bool is_lsl = chunkname.find(".lsl") != std::string::npos;
     if (is_lsl)
     {
-#ifdef LUAU_USE_TAILSLIDE
-        bytecode = compileLSL(*source);
+        bytecode = compileLSL(*source, nullptr, globalOptions.debugLevel >= 1);
         lua_setthreaddata(L, lua_getthreaddata(GL));
-#else
-        fprintf(stderr, "No LSL support, do a Tailslide-enabled build\n");
-        exit(1);
-#endif
     }
     else
     {
@@ -703,18 +741,40 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
     }
     int status = 0;
 
-    lua_setmemcat(L, 0);
     if (luau_load(L, chunkname.c_str(), bytecode.data(), bytecode.size(), 0) == 0)
     {
-        lua_setmemcat(L, 2);
+        replFreeObjects = lua_collectfreeobjects(L);
+        replBytecodeSize = bytecode.size();
+
+        if (sl)
+        {
+            luaSL_createeventmanager(L);
+            lua_ref(L, -1);
+            lua_pushvalue(L, -1);
+            lua_setglobal(L, "LLEvents");
+            luaSL_createtimermanager(L);
+            lua_ref(L, -1);
+            lua_setglobal(L, "LLTimers");
+        }
         if (codegen)
         {
             Luau::CodeGen::CompilationOptions nativeOptions;
+            if (codegenCold)
+            {
+                nativeOptions.flags = Luau::CodeGen::CodeGen_ColdFunctions;
+            }
+
+            if (countersActive())
+                nativeOptions.recordCounters = true;
+
             Luau::CodeGen::compile(L, -1, nativeOptions);
         }
 
         if (coverageActive())
             coverageTrack(L, -1);
+
+        if (countersActive())
+            countersTrack(L, -1);
 
         setupArguments(L, program_argc, program_argv);
         status = lua_resume(L, NULL, program_argc);
@@ -766,6 +826,7 @@ static void displayHelp(const char* argv0)
     printf("\n");
     printf("Available options:\n");
     printf("  --coverage: collect code coverage while running the code and output results to coverage.out\n");
+    printf("  --counters: collect native counters data while running the code and output results to callgrind.out\n");
     printf("  -h, --help: Display this usage message.\n");
     printf("  -i, --interactive: Run an interactive REPL after executing the last script specified.\n");
     printf("  -O<n>: compile with optimization level n (default 1, n should be between 0 and 2).\n");
@@ -775,7 +836,11 @@ static void displayHelp(const char* argv0)
     printf("  --lsl: run REPL with LSL semantics\n");
     printf("  --sl: run REPL with SL semantics\n");
     printf("  --codegen: execute code using native code generation\n");
+    printf("  --codegen-cold: execute code using native code generation, including any functions deemed not profitable to natively compile\n");
+    printf("  --codegen-perf: execute code using native code generation and profile using perf (only on Linux)\n");
     printf("  --program-args,-a: declare start of arguments to be passed to the Luau program\n");
+    printf("  --fflags=<flags>: comma-separated list of fast flags to enable/disable (--fflags=true,false,LuauFlag1=true,LuauFlag2=false).\n");
+    printf("  --jit-inliner: enable JIT bytecode inliner\n");
 }
 
 static int assertionHandler(const char* expr, const char* file, int line, const char* function)
@@ -796,6 +861,7 @@ int replMain(int argc, char** argv)
     bool coverage = false;
     bool interactive = false;
     bool codegenPerf = false;
+    bool counters = false;
     int program_args = argc;
 
     for (int i = 1; i < argc; i++)
@@ -841,6 +907,11 @@ int replMain(int argc, char** argv)
         {
             codegen = true;
         }
+        else if (strcmp(argv[i], "--codegen-cold") == 0)
+        {
+            codegen = true;
+            codegenCold = true;
+        }
         else if (strcmp(argv[i], "--codegen-perf") == 0)
         {
             codegen = true;
@@ -849,6 +920,10 @@ int replMain(int argc, char** argv)
         else if (strcmp(argv[i], "--coverage") == 0)
         {
             coverage = true;
+        }
+        else if (strcmp(argv[i], "--counters") == 0)
+        {
+            counters = true;
         }
         else if (strcmp(argv[i], "--timetrace") == 0)
         {
@@ -866,6 +941,10 @@ int replMain(int argc, char** argv)
         {
             luauSL_init_global_builtins(argv[i] + 14);
             builtinsLoaded = true;
+        }
+        else if (strcmp(argv[i], "--jit-inliner") == 0)
+        {
+            jitInliner = true;
         }
         else if (strncmp(argv[i], "--fflags=", 9) == 0)
         {
@@ -897,6 +976,8 @@ int replMain(int argc, char** argv)
     program_argc = argc - program_args;
     program_argv = &argv[program_args];
 
+    if (lsl || sl)
+        Luau::setRequiredSLuaFlags();
 
 #if !defined(LUAU_ENABLE_TIME_TRACE)
     if (FFlag::DebugLuauTimeTracing)
@@ -919,7 +1000,9 @@ int replMain(int argc, char** argv)
             codegenPerfLog,
             [](void* context, uintptr_t addr, unsigned size, const char* symbol)
             {
-                fprintf(static_cast<FILE*>(context), "%016lx %08x %s\n", long(addr), size, symbol);
+                FILE* outputFile = static_cast<FILE*>(context);
+                fprintf(outputFile, "%016lx %08x %s\n", long(addr), size, symbol);
+                fflush(outputFile);
             }
         );
 #else
@@ -951,6 +1034,9 @@ int replMain(int argc, char** argv)
         if (coverage)
             coverageInit(L);
 
+        if (counters)
+            countersInit(L);
+
         int failed = 0;
 
         for (size_t i = 0; i < files.size(); ++i)
@@ -967,6 +1053,9 @@ int replMain(int argc, char** argv)
 
         if (coverage)
             coverageDump("coverage.out");
+
+        if (counters)
+            countersDump("callgrind.out");
 
         return failed ? 1 : 0;
     }

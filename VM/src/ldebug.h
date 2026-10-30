@@ -12,6 +12,12 @@
 
 #define LUA_MEMERRMSG "not enough memory"
 #define LUA_ERRERRMSG "error in error handling"
+// ServerLua: pinned like the two above, so raising them never allocates
+#define LUA_MANDATORYYIELDMSG "Failed to perform mandatory yield"
+#define LUA_CSTACKOVERFLOWMSG "C stack overflow"
+#define LUA_NONSUSPENDEDMSG "cannot resume non-suspended coroutine"
+// ServerLua: raised when the host won't let a script use a thread
+#define LUA_THREADREFUSEDMSG "coroutine is not accessible"
 
 LUAI_FUNC l_noret luaG_typeerrorL(lua_State* L, const TValue* o, const char* opname);
 LUAI_FUNC l_noret luaG_forerrorL(lua_State* L, const TValue* o, const char* what);
@@ -20,6 +26,7 @@ LUAI_FUNC l_noret luaG_aritherror(lua_State* L, const TValue* p1, const TValue* 
 LUAI_FUNC l_noret luaG_ordererror(lua_State* L, const TValue* p1, const TValue* p2, TMS op);
 LUAI_FUNC l_noret luaG_indexerror(lua_State* L, const TValue* p1, const TValue* p2);
 LUAI_FUNC l_noret luaG_methoderror(lua_State* L, const TValue* p1, const TString* p2);
+LUAI_FUNC l_noret luaG_missingmembererror(lua_State* L, const TValue* p1, const TValue* p2);
 LUAI_FUNC l_noret luaG_readonlyerror(lua_State* L);
 
 LUAI_FUNC LUA_PRINTF_ATTR(2, 3) l_noret luaG_runerrorL(lua_State* L, const char* fmt, ...);

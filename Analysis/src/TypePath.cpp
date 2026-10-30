@@ -12,15 +12,10 @@
 #include "Luau/TypePack.h"
 #include "Luau/TypeOrPack.h"
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <sstream>
-
-LUAU_FASTFLAG(LuauSolverV2);
-LUAU_FASTFLAG(LuauEmplaceNotPushBack)
-LUAU_FASTFLAGVARIABLE(LuauConsiderErrorSuppressionInTypes)
-LUAU_FASTFLAG(LuauNewOverloadResolver)
-LUAU_FASTFLAG(LuauNewNonStrictBetterCheckedFunctionErrorMessage)
 
 // Maximum number of steps to follow when traversing a path. May not always
 // equate to the number of components in a path, depending on the traversal
@@ -182,127 +177,85 @@ Path PathBuilder::build()
 
 PathBuilder& PathBuilder::readProp(std::string name)
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(Property{std::move(name), true});
-    else
-        components.push_back(Property{std::move(name), true});
+    components.emplace_back(Property{std::move(name), true});
     return *this;
 }
 
 PathBuilder& PathBuilder::writeProp(std::string name)
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(Property{std::move(name), false});
-    else
-        components.push_back(Property{std::move(name), false});
+    components.emplace_back(Property{std::move(name), false});
     return *this;
 }
 
 PathBuilder& PathBuilder::prop(std::string name)
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(Property{std::move(name)});
-    else
-        components.push_back(Property{std::move(name)});
+    components.emplace_back(Property{std::move(name)});
     return *this;
 }
 
 PathBuilder& PathBuilder::index(size_t i)
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(Index{i});
-    else
-        components.push_back(Index{i});
+    components.emplace_back(Index{i});
     return *this;
 }
 
 PathBuilder& PathBuilder::mt()
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(TypeField::Metatable);
-    else
-        components.push_back(TypeField::Metatable);
+    components.emplace_back(TypeField::Metatable);
     return *this;
 }
 
 PathBuilder& PathBuilder::lb()
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(TypeField::LowerBound);
-    else
-        components.push_back(TypeField::LowerBound);
+    components.emplace_back(TypeField::LowerBound);
     return *this;
 }
 
 PathBuilder& PathBuilder::ub()
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(TypeField::UpperBound);
-    else
-        components.push_back(TypeField::UpperBound);
+    components.emplace_back(TypeField::UpperBound);
     return *this;
 }
 
 PathBuilder& PathBuilder::indexKey()
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(TypeField::IndexLookup);
-    else
-        components.push_back(TypeField::IndexLookup);
+    components.emplace_back(TypeField::IndexLookup);
     return *this;
 }
 
 PathBuilder& PathBuilder::indexValue()
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(TypeField::IndexResult);
-    else
-        components.push_back(TypeField::IndexResult);
+    components.emplace_back(TypeField::IndexResult);
     return *this;
 }
 
 PathBuilder& PathBuilder::negated()
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(TypeField::Negated);
-    else
-        components.push_back(TypeField::Negated);
+    components.emplace_back(TypeField::Negated);
     return *this;
 }
 
 PathBuilder& PathBuilder::variadic()
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(TypeField::Variadic);
-    else
-        components.push_back(TypeField::Variadic);
+    components.emplace_back(TypeField::Variadic);
     return *this;
 }
 
 PathBuilder& PathBuilder::args()
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(PackField::Arguments);
-    else
-        components.push_back(PackField::Arguments);
+    components.emplace_back(PackField::Arguments);
     return *this;
 }
 
 PathBuilder& PathBuilder::rets()
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(PackField::Returns);
-    else
-        components.push_back(PackField::Returns);
+    components.emplace_back(PackField::Returns);
     return *this;
 }
 
 PathBuilder& PathBuilder::tail()
 {
-    if (FFlag::LuauEmplaceNotPushBack)
-        components.emplace_back(PackField::Tail);
-    else
-        components.push_back(PackField::Tail);
+    components.emplace_back(PackField::Tail);
     return *this;
 }
 
@@ -322,6 +275,37 @@ PathBuilder& PathBuilder::mappedGenericPack(TypePackId mappedType)
 
 namespace
 {
+
+bool isSingletonTypePack(TypePackId pack)
+{
+    DenseHashSet<TypePackId> seen;
+    bool foundElement = false;
+    int steps = 0;
+
+    while (pack && ++steps <= DFInt::LuauTypePathMaximumTraverseSteps)
+    {
+        // if we've already seen it, we can early return
+        if (!seen.try_insert(pack))
+            return false;
+
+        if (const auto* bound = get<Unifiable::Bound<TypePackId>>(pack))
+        {
+            pack = bound->boundTo;
+            continue;
+        }
+
+        const TypePack* typePack = get<TypePack>(pack);
+        if (!typePack || typePack->head.size() > 1 || (foundElement && !typePack->head.empty()))
+            return false;
+
+        foundElement = foundElement || !typePack->head.empty();
+        if (!typePack->tail)
+            return foundElement;
+        pack = *typePack->tail;
+    }
+
+    return false;
+}
 
 struct TraversalState
 {
@@ -424,11 +408,7 @@ struct TraversalState
 
         if (prop)
         {
-            std::optional<TypeId> maybeType;
-            if (FFlag::LuauSolverV2)
-                maybeType = property.isRead ? prop->readTy : prop->writeTy;
-            else
-                maybeType = prop->type_DEPRECATED();
+            std::optional<TypeId> maybeType = property.isRead ? prop->readTy : prop->writeTy;
 
             if (maybeType)
             {
@@ -449,7 +429,7 @@ struct TraversalState
         {
             bool updatedCurrent = false;
 
-            if (FFlag::LuauConsiderErrorSuppressionInTypes && get<ErrorType>(*currentType))
+            if (get<ErrorType>(*currentType))
             {
                 encounteredErrorSuppression = true;
                 return false;
@@ -458,66 +438,41 @@ struct TraversalState
             if (auto u = get<UnionType>(*currentType))
             {
                 auto it = begin(u);
-                if (FFlag::LuauConsiderErrorSuppressionInTypes)
+                // We want to track the index that updates the current type with `idx` while still iterating through the entire union to check for
+                // error types with `it`.
+                size_t idx = 0;
+                for (auto it = begin(u); it != end(u); ++it)
                 {
-                    // We want to track the index that updates the current type with `idx` while still iterating through the entire union to check for error types with `it`.
-                    size_t idx = 0;
-                    for (auto it = begin(u); it != end(u); ++it)
-                    {
-                        if (get<ErrorType>(*it))
-                            encounteredErrorSuppression = true;
-                        if (idx == index.index)
-                        {
-                            updateCurrent(*it);
-                            updatedCurrent = true;
-                        }
-                        ++idx;
-                    }
-                }
-                else
-                {
-                    std::advance(it, index.index);
-
-                    if (it != end(u))
+                    if (get<ErrorType>(*it))
+                        encounteredErrorSuppression = true;
+                    if (idx == index.index)
                     {
                         updateCurrent(*it);
-                        return true;
+                        updatedCurrent = true;
                     }
+                    ++idx;
                 }
             }
             else if (auto i = get<IntersectionType>(*currentType))
             {
                 auto it = begin(i);
-                if (FFlag::LuauConsiderErrorSuppressionInTypes)
+                // We want to track the index that updates the current type with `idx` while still iterating through the entire intersection to check
+                // for error types with `it`.
+                size_t idx = 0;
+                for (auto it = begin(i); it != end(i); ++it)
                 {
-                    // We want to track the index that updates the current type with `idx` while still iterating through the entire intersection to check for error types with `it`.
-                    size_t idx = 0;
-                    for (auto it = begin(i); it != end(i); ++it)
-                    {
-                        if (get<ErrorType>(*it))
-                            encounteredErrorSuppression = true;
-                        if (idx == index.index)
-                        {
-                            updateCurrent(*it);
-                            updatedCurrent = true;
-                        }
-                        ++idx;
-                    }
-                }
-                else
-                {
-                    std::advance(it, index.index);
-
-                    if (it != end(i))
+                    if (get<ErrorType>(*it))
+                        encounteredErrorSuppression = true;
+                    if (idx == index.index)
                     {
                         updateCurrent(*it);
-                        return true;
+                        updatedCurrent = true;
                     }
+                    ++idx;
                 }
             }
 
-            if (FFlag::LuauConsiderErrorSuppressionInTypes)
-                return updatedCurrent;
+            return updatedCurrent;
         }
         else
         {
@@ -712,7 +667,63 @@ struct TraversalState
     }
 };
 
+bool traverse(TraversalState& state, const Path& path, TypePathRenderMetadata* renderMetadata = nullptr)
+{
+    auto step = [&state](auto&& component)
+    {
+        return state.traverse(component);
+    };
+
+    for (size_t i = 0; i < path.components.size(); ++i)
+    {
+        if (renderMetadata)
+        {
+            if (i > 0)
+            {
+                const auto* field = get_if<TypePath::PackField>(&path.components[i - 1]);
+                const auto* index = get_if<TypePath::Index>(&path.components[i]);
+                if (field && *field == TypePath::PackField::Returns && index && index->variant == TypePath::Index::Variant::Pack && index->index == 0)
+                {
+                    if (const TypePackId* pack = get_if<TypePackId>(&state.current))
+                        renderMetadata->returnTypePacks.try_insert(i, TypePathRenderMetadata::ReturnTypePackInfo{*pack, isSingletonTypePack(*pack)});
+                }
+            }
+
+            const auto* typeField = get_if<TypePath::TypeField>(&path.components[i]);
+            if (i + 1 == path.components.size() && typeField && *typeField == TypePath::TypeField::Negated)
+            {
+                if (const TypeId* type = get_if<TypeId>(&state.current); type && get<NegationType>(follow(*type)))
+                    renderMetadata->enclosingNegation = *type;
+            }
+        }
+
+        if (!visit(step, path.components[i]))
+            return false;
+    }
+
+    return true;
+}
+
+template<typename TID>
+TypePathRenderMetadata deriveRenderMetadataImpl(TID root, const TypePath::Path& path, NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena)
+{
+    TraversalState state{follow(root), builtinTypes, arena};
+    TypePathRenderMetadata options;
+    traverse(state, path, &options);
+    return options;
+}
+
 } // namespace
+
+TypePathRenderMetadata deriveRenderMetadata(TypeId root, const TypePath::Path& path, NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena)
+{
+    return deriveRenderMetadataImpl(root, path, builtinTypes, arena);
+}
+
+TypePathRenderMetadata deriveRenderMetadata(TypePackId root, const TypePath::Path& path, NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena)
+{
+    return deriveRenderMetadataImpl(root, path, builtinTypes, arena);
+}
 
 std::string toString(const TypePath::Path& path, bool prefixDot)
 {
@@ -725,13 +736,10 @@ std::string toString(const TypePath::Path& path, bool prefixDot)
         if constexpr (std::is_same_v<T, TypePath::Property>)
         {
             result << '[';
-            if (FFlag::LuauSolverV2)
-            {
-                if (c.isRead)
-                    result << "read ";
-                else
-                    result << "write ";
-            }
+            if (c.isRead)
+                result << "read ";
+            else
+                result << "write ";
 
             result << '"' << c.name << '"' << ']';
         }
@@ -817,286 +825,476 @@ std::string toString(const TypePath::Path& path, bool prefixDot)
     return result.str();
 }
 
-std::string toStringHuman(const TypePath::Path& path)
+namespace
 {
-    enum class State
+struct RenderTypePath
+{
+    explicit RenderTypePath(const TypePathRenderMetadata& options)
+        : options(&options)
     {
-        Initial,
-        Normal,
+    }
+
+    enum class Kind
+    {
+        None,
         Property,
-        PendingIs,
-        PendingAs,
-        PendingWhich,
+        Metatable,
+        Table,
+        IndexMember,
+        PackEntry,
+        Parameter,
+        ReturnValue,
+        ReturnType,
+        ParameterTypes,
+        ReturnTypes,
+        Tail,
+        Variadic,
+        PackSlice,
+        Reduction,
+        MappedPack,
+        IndexerResult,
+        Other,
     };
 
-    std::stringstream result;
-    State state = State::Initial;
-    bool last = false;
-
-    auto strComponent = [&](auto&& c)
+    struct Phrase
     {
-        using T = std::decay_t<decltype(c)>;
-        if constexpr (std::is_same_v<T, TypePath::Property>)
+        Kind kind = Kind::None;
+        std::string text;
+        // Write properties need an alternate form when another phrase is
+        // built on top of them ("a value assigned to ...").
+        std::string nestedText;
+        bool propertyIsRead = true;
+        std::string propertyPrefix;
+        std::string propertyName;
+        std::string functionOwner;
+        std::optional<TypePath::PackField> tailOwner;
+        std::string mappedPackEntryOwner;
+        bool mappedPackIsTail = false;
+        bool plural = false;
+        std::string terminalOverride;
+    };
+
+    NotNull<const TypePathRenderMetadata> options;
+    Phrase current;
+    size_t componentIndex = 0;
+
+    void render(const TypePath::Component& component, size_t index)
+    {
+        componentIndex = index;
+        visit(
+            [this](const auto& component)
+            {
+                render(component);
+            },
+            component
+        );
+    }
+
+    void render(const TypePath::Property& property)
+    {
+        Phrase next;
+        next.kind = Kind::Property;
+        next.propertyIsRead = property.isRead;
+
+        if (current.kind == Kind::Property && current.propertyIsRead)
         {
-            if (state == State::PendingIs)
-                result << ", ";
-
-            switch (state)
-            {
-            case State::Initial:
-            case State::PendingIs:
-                if (c.isRead)
-                    result << "accessing `";
-                else
-                    result << "writing to `";
-                break;
-            case State::Property:
-                // if the previous state was a property, then we're doing a sequence of indexing
-                result << '.';
-                break;
-            default:
-                break;
-            }
-
-            result << c.name;
-
-            state = State::Property;
+            next.propertyPrefix = current.propertyPrefix;
+            next.propertyName = current.propertyName + "." + property.name;
         }
-        else if constexpr (std::is_same_v<T, TypePath::Index>)
-        {
-            if (FFlag::LuauNewNonStrictBetterCheckedFunctionErrorMessage)
-            {
-                if (state == State::Initial && !last)
-                    result << "in" << ' ';
-                else if (state == State::PendingIs)
-                    result << ' ' << "has" << ' ';
-                else if (state == State::Property)
-                    result << '`' << ' ' << "has" << ' ';
-
-                result << "the " << toHumanReadableIndex(c.index);
-            }
-            else
-            {
-                size_t humanIndex = c.index + 1;
-
-                if (state == State::Initial && !last)
-                    result << "in" << ' ';
-                else if (state == State::PendingIs)
-                    result << ' ' << "has" << ' ';
-                else if (state == State::Property)
-                    result << '`' << ' ' << "has" << ' ';
-
-                result << "the " << humanIndex;
-                switch (humanIndex)
-                {
-                case 1:
-                    result << "st";
-                    break;
-                case 2:
-                    result << "nd";
-                    break;
-                case 3:
-                    result << "rd";
-                    break;
-                default:
-                    result << "th";
-                }
-            }
-
-            switch (c.variant)
-            {
-            case TypePath::Index::Variant::Pack:
-                result << ' ' << "entry in the type pack";
-                break;
-            case TypePath::Index::Variant::Union:
-                result << ' ' << "component of the union";
-                break;
-            case TypePath::Index::Variant::Intersection:
-                result << ' ' << "component of the intersection";
-                break;
-            }
-
-            if (state == State::PendingWhich)
-                result << ' ' << "which";
-
-            if (state == State::PendingIs || state == State::Property)
-                state = State::PendingAs;
-            else
-                state = State::PendingIs;
-        }
-        else if constexpr (std::is_same_v<T, TypePath::TypeField>)
-        {
-            if (state == State::Initial && !last)
-                result << "in" << ' ';
-            else if (state == State::PendingIs)
-                result << ", ";
-            else if (state == State::Property)
-                result << '`' << ' ' << "has" << ' ';
-
-            switch (c)
-            {
-            case TypePath::TypeField::Table:
-                result << "the table portion";
-                if (state == State::Property)
-                    state = State::PendingAs;
-                else
-                    state = State::PendingIs;
-                break;
-            case TypePath::TypeField::Metatable:
-                result << "the metatable portion";
-                if (state == State::Property)
-                    state = State::PendingAs;
-                else
-                    state = State::PendingIs;
-                break;
-            case TypePath::TypeField::LowerBound:
-                result << "the lower bound of" << ' ';
-                state = State::Normal;
-                break;
-            case TypePath::TypeField::UpperBound:
-                result << "the upper bound of" << ' ';
-                state = State::Normal;
-                break;
-            case TypePath::TypeField::IndexLookup:
-                result << "the index type";
-                if (state == State::Property)
-                    state = State::PendingAs;
-                else
-                    state = State::PendingIs;
-                break;
-            case TypePath::TypeField::IndexResult:
-                result << "the result of indexing";
-                if (state == State::Property)
-                    state = State::PendingAs;
-                else
-                    state = State::PendingIs;
-                break;
-            case TypePath::TypeField::Negated:
-                result << "the negation" << ' ';
-                state = State::Normal;
-                break;
-            case TypePath::TypeField::Variadic:
-                result << "the variadic" << ' ';
-                state = State::Normal;
-                break;
-            }
-        }
-        else if constexpr (std::is_same_v<T, TypePath::PackField>)
-        {
-            if (state == State::PendingIs)
-                result << ", ";
-            else if (state == State::Property)
-                result << "`, ";
-
-            switch (c)
-            {
-            case TypePath::PackField::Arguments:
-                if (state == State::Initial)
-                    result << "it" << ' ';
-                else if (state == State::PendingIs)
-                    result << "the function" << ' ';
-
-                result << "takes";
-                break;
-            case TypePath::PackField::Returns:
-                if (state == State::Initial)
-                    result << "it" << ' ';
-                else if (state == State::PendingIs)
-                    result << "the function" << ' ';
-
-                result << "returns";
-                break;
-            case TypePath::PackField::Tail:
-                if (state == State::Initial)
-                    result << "it has" << ' ';
-                result << "a tail of";
-                break;
-            }
-
-            if (state == State::PendingIs)
-            {
-                result << ' ';
-                state = State::PendingWhich;
-            }
-            else
-            {
-                result << ' ';
-                state = State::Normal;
-            }
-        }
-        else if constexpr (std::is_same_v<T, TypePath::PackSlice>)
-            result << "the portion of the type pack starting at index " << c.start_index << " to the end";
-        else if constexpr (std::is_same_v<T, TypePath::Reduction>)
-        {
-            if (state == State::Initial)
-                result << "it" << ' ';
-            result << "reduces to" << ' ';
-            state = State::Normal;
-        }
-        else if constexpr (std::is_same_v<T, TypePath::GenericPackMapping>)
-            result << "is a generic pack mapped to ";
         else
         {
-            static_assert(always_false_v<T>, "Unhandled Component variant");
+            next.propertyName = property.name;
+            if (current.kind == Kind::Metatable)
+                next.propertyPrefix = "in " + current.text;
+            else if (current.kind == Kind::IndexMember || current.kind == Kind::IndexerResult)
+                next.propertyPrefix = "in " + current.text;
+            else if (current.kind != Kind::None)
+                next.propertyPrefix = "of " + (current.nestedText.empty() ? current.text : current.nestedText);
         }
-    };
 
-    size_t count = 0;
+        next.text = "property `" + next.propertyName + "`";
+        if (!next.propertyPrefix.empty())
+            next.text += " " + next.propertyPrefix;
 
-    for (const TypePath::Component& component : path.components)
-    {
-        count++;
-        if (count == path.components.size())
-            last = true;
+        next.nestedText = next.text;
+        if (!next.propertyIsRead)
+            next.nestedText = "a value assigned to " + next.text;
 
-        Luau::visit(strComponent, component);
+        current = std::move(next);
     }
 
-    switch (state)
+    void render(const TypePath::Index& index)
     {
-    case State::Property:
-        result << "` results in ";
-        break;
-    case State::PendingWhich:
-        // pending `which` becomes `is` if it's at the end
-        result << "is" << ' ';
-        break;
-    case State::PendingIs:
-        result << ' ' << "is" << ' ';
-        break;
-    case State::PendingAs:
-        result << ' ' << "as" << ' ';
-        break;
-    default:
-        break;
+        if (index.variant != TypePath::Index::Variant::Pack)
+            return;
+
+        Phrase next;
+        const std::string position = toHumanReadableIndex(index.index);
+        const std::string context = current.nestedText.empty() ? current.text : current.nestedText;
+
+        switch (current.kind)
+        {
+        case Kind::ParameterTypes:
+            next.kind = Kind::Parameter;
+            next.text = "the " + position + " parameter";
+
+            if (!current.functionOwner.empty())
+                next.text += " of " + current.functionOwner;
+
+            break;
+
+        case Kind::ReturnTypes:
+        {
+            const TypePathRenderMetadata::ReturnTypePackInfo* returnTypePack = options->returnTypePacks.find(componentIndex);
+            if (returnTypePack && returnTypePack->isSingular)
+            {
+                next.kind = Kind::ReturnType;
+                next.text = "the return type";
+            }
+            else
+            {
+                next.kind = Kind::ReturnValue;
+                next.text = "the " + position + " return value";
+            }
+
+            if (!current.functionOwner.empty())
+                next.text += " of " + current.functionOwner;
+
+            break;
+        }
+
+        case Kind::MappedPack:
+            next.kind = Kind::PackEntry;
+            next.text = "the " + position + " entry of " + current.mappedPackEntryOwner;
+            break;
+
+        default:
+            next.kind = Kind::PackEntry;
+            next.text = "the " + position + " type pack entry";
+
+            if (!context.empty())
+                next.text += " of " + context;
+
+            break;
+        }
+
+        next.nestedText = next.text;
+        current = std::move(next);
     }
 
-    return result.str();
-}
+    void render(TypePath::TypeField field)
+    {
+        Phrase next;
+        const std::string context = current.nestedText.empty() ? current.text : current.nestedText;
+        switch (field)
+        {
+        case TypePath::TypeField::Table:
+            next.kind = Kind::Table;
+            next.text = "the table portion" + (context.empty() ? "" : " of " + context);
+            break;
 
-static bool traverse(TraversalState& state, const Path& path)
+        case TypePath::TypeField::Metatable:
+            next.kind = Kind::Metatable;
+            next.text = "the metatable" + (context.empty() ? "" : " of " + context);
+
+            if (current.kind == Kind::Property)
+                next.terminalOverride = current.text + (current.propertyIsRead ? " has metatable " : " accepts values with metatable ");
+
+            break;
+
+        case TypePath::TypeField::LowerBound:
+            next.kind = Kind::Other;
+            next.text = "the lower bound" + (context.empty() ? "" : " of " + context);
+            break;
+
+        case TypePath::TypeField::UpperBound:
+            next.kind = Kind::Other;
+            next.text = "the upper bound" + (context.empty() ? "" : " of " + context);
+            break;
+
+        case TypePath::TypeField::IndexLookup:
+            next.kind = Kind::Other;
+            next.text = "the indexer key type" + (context.empty() ? "" : " of " + context);
+            break;
+
+        case TypePath::TypeField::IndexResult:
+            next.kind = Kind::IndexerResult;
+            next.text = "the indexer result" + (context.empty() ? "" : " of " + context);
+            break;
+
+        case TypePath::TypeField::Negated:
+            next.kind = Kind::Other;
+            next.text = "the negated type" + (context.empty() ? "" : " in " + context);
+            break;
+
+        case TypePath::TypeField::Variadic:
+            next.kind = Kind::Variadic;
+            next.functionOwner = current.functionOwner;
+
+            if (current.kind == Kind::Tail && current.tailOwner == TypePath::PackField::Arguments)
+                next.text = "the variadic parameter";
+            else if (current.kind == Kind::Tail && current.tailOwner == TypePath::PackField::Returns)
+                next.text = "the variadic return value";
+            else
+                next.text = "the variadic tail";
+
+            if (!next.functionOwner.empty())
+                next.text += " of " + next.functionOwner;
+
+            break;
+        }
+
+        next.nestedText = next.text;
+        current = std::move(next);
+    }
+
+    void render(TypePath::PackField field)
+    {
+        Phrase next;
+        const std::string context = current.nestedText.empty() ? current.text : current.nestedText;
+        switch (field)
+        {
+        case TypePath::PackField::Tail:
+            next.kind = Kind::Tail;
+            if (current.kind == Kind::ParameterTypes)
+                next.tailOwner = TypePath::PackField::Arguments;
+            else if (current.kind == Kind::ReturnTypes)
+                next.tailOwner = TypePath::PackField::Returns;
+
+            next.functionOwner = current.functionOwner;
+
+            if (next.tailOwner == TypePath::PackField::Arguments)
+                next.text = "the parameter type pack tail" + (next.functionOwner.empty() ? "" : " of " + next.functionOwner);
+            else if (next.tailOwner == TypePath::PackField::Returns)
+                next.text = "the return type pack tail" + (next.functionOwner.empty() ? "" : " of " + next.functionOwner);
+            else
+                next.text = "the type pack's tail" + (context.empty() ? "" : " of " + context);
+
+            break;
+
+        case TypePath::PackField::Arguments:
+            next.kind = Kind::ParameterTypes;
+            next.text = "the parameter types";
+            break;
+
+        case TypePath::PackField::Returns:
+            next.kind = Kind::ReturnTypes;
+            next.text = "the return types";
+            break;
+        }
+
+        if (field != TypePath::PackField::Tail)
+        {
+            if (current.kind == Kind::Metatable)
+                next.functionOwner = "the metatable function";
+            else if (current.kind == Kind::Property && !current.propertyIsRead)
+            {
+                next.functionOwner = "a function assigned to `" + current.propertyName + "`";
+                if (!current.propertyPrefix.empty())
+                    next.functionOwner += " " + current.propertyPrefix;
+            }
+            else if (current.kind == Kind::ReturnType)
+                next.functionOwner = "the function returned by this function";
+            else if (current.kind != Kind::None)
+                next.functionOwner = context;
+
+            if (!next.functionOwner.empty())
+                next.text += " of " + next.functionOwner;
+        }
+
+        next.nestedText = next.text;
+        current = std::move(next);
+    }
+
+    void render(const TypePath::PackSlice& slice)
+    {
+        Phrase next;
+        next.kind = Kind::PackSlice;
+
+        const std::string position = toHumanReadableIndex(slice.start_index);
+        switch (current.kind)
+        {
+        case Kind::ParameterTypes:
+            next.plural = true;
+            if (current.functionOwner == "the metatable function")
+                next.text = "the metatable function's parameters from the " + position + " onward";
+            else
+            {
+                next.text = "the parameters";
+                if (!current.functionOwner.empty())
+                    next.text += " of " + current.functionOwner;
+                next.text += " from the " + position + " onward";
+            }
+            break;
+
+        case Kind::ReturnTypes:
+            next.plural = true;
+            if (current.functionOwner == "the metatable function")
+                next.text = "the metatable function's return values from the " + position + " onward";
+            else
+            {
+                next.text = "the return values";
+                if (!current.functionOwner.empty())
+                    next.text += " of " + current.functionOwner;
+                next.text += " from the " + position + " onward";
+            }
+            break;
+
+        case Kind::MappedPack:
+            if (current.tailOwner == TypePath::PackField::Arguments)
+                next.text = "the substituted parameter tail";
+            else if (current.tailOwner == TypePath::PackField::Returns)
+                next.text = "the substituted return tail";
+            else if (current.mappedPackIsTail)
+                next.text = "the substituted type pack tail";
+            else
+                next.text = "the substituted type pack";
+
+            if (!current.functionOwner.empty())
+                next.text += " for " + current.functionOwner;
+            next.text += ", from its " + position + " entry onward,";
+            break;
+
+        default:
+            next.text = "the type pack from its " + position + " entry onward";
+        }
+
+        next.nestedText = next.text;
+        current = std::move(next);
+    }
+
+    void render(const TypePath::Reduction&)
+    {
+        Phrase next;
+
+        next.kind = Kind::Reduction;
+
+        if (current.nestedText.empty())
+            next.text = "the reduced type";
+        else
+            next.text = "the reduced form of " + current.nestedText;
+
+        next.nestedText = next.text;
+        current = std::move(next);
+    }
+
+    void render(const TypePath::GenericPackMapping&)
+    {
+        Phrase next;
+        next.kind = Kind::MappedPack;
+
+        switch (current.kind)
+        {
+        case Kind::Tail:
+        {
+            next.mappedPackIsTail = true;
+            next.tailOwner = current.tailOwner;
+            next.functionOwner = current.functionOwner;
+
+            if (current.tailOwner == TypePath::PackField::Arguments)
+            {
+                next.text = "the parameter type pack tail" + (next.functionOwner.empty() ? "" : " of " + next.functionOwner);
+                next.mappedPackEntryOwner =
+                    "the substituted parameter type pack tail" + (next.functionOwner.empty() ? "" : " of " + next.functionOwner);
+            }
+            else if (current.tailOwner == TypePath::PackField::Returns)
+            {
+                next.text = "the return type pack tail" + (next.functionOwner.empty() ? "" : " of " + next.functionOwner);
+                next.mappedPackEntryOwner = "the substituted return type pack tail" + (next.functionOwner.empty() ? "" : " of " + next.functionOwner);
+            }
+            else
+            {
+                next.text = "the type pack tail";
+                next.mappedPackEntryOwner = "the substituted type pack tail";
+            }
+
+            break;
+        }
+
+        default:
+            next.text = "the generic type pack";
+            next.mappedPackEntryOwner = "the substituted type pack";
+            break;
+        }
+
+        next.nestedText = next.text;
+        current = std::move(next);
+    }
+
+    RenderedTypePath finalize()
+    {
+        std::string subject = current.text;
+        if (current.kind == Kind::Property && !current.propertyIsRead)
+            subject = "values assigned to " + current.text;
+
+        if (!current.terminalOverride.empty())
+            return {std::move(subject), std::move(current.terminalOverride)};
+
+        switch (current.kind)
+        {
+        case Kind::None:
+            return {};
+
+        case Kind::Property:
+            if (current.propertyIsRead)
+                return {std::move(subject), current.text + " has type "};
+            else
+                return {std::move(subject), current.text + " accepts values of type "};
+
+        case Kind::Parameter:
+        case Kind::ReturnValue:
+            return {std::move(subject), current.text + " has type "};
+
+        case Kind::ParameterTypes:
+        case Kind::ReturnTypes:
+            return {std::move(subject), current.text + " are "};
+
+        case Kind::PackSlice:
+            if (current.plural)
+                return {std::move(subject), current.text + " are "};
+            else
+                return {std::move(subject), current.text + " is "};
+
+        case Kind::Variadic:
+            if (current.text == "the variadic tail")
+                return {std::move(subject), current.text + " has element type "};
+            else
+                return {std::move(subject), current.text + " has type "};
+
+        case Kind::MappedPack:
+            return {std::move(subject), current.text + " is substituted with "};
+
+        default:
+            return {std::move(subject), current.text + " is "};
+        }
+    }
+};
+} // namespace
+
+RenderedTypePath renderTypePath(const TypePath::Path& path, const TypePathRenderMetadata& options)
 {
-    auto step = [&state](auto&& c)
-    {
-        return state.traverse(c);
-    };
+    RenderTypePath renderer{options};
+    for (size_t componentIndex = 0; componentIndex < path.components.size(); ++componentIndex)
+        renderer.render(path.components[componentIndex], componentIndex);
 
-    for (const TypePath::Component& component : path.components)
-    {
-        bool stepSuccess = visit(step, component);
-        if (!stepSuccess)
-            return false;
-    }
-
-    return true;
+    RenderedTypePath result = renderer.finalize();
+    result.enclosingNegation = options.enclosingNegation;
+    return result;
 }
 
-std::optional<TypeOrPack> traverse(const TypePackId root, const Path& path, const NotNull<BuiltinTypes> builtinTypes, const NotNull<TypeArena> arena)
+
+std::optional<TypeOrPack> traverse(
+    const TypePackId root,
+    const Path& path,
+    const NotNull<BuiltinTypes> builtinTypes,
+    const NotNull<TypeArena> arena,
+    TypePathRenderMetadata* renderMetadata
+)
 {
     TraversalState state(follow(root), builtinTypes, arena);
-    if (traverse(state, path))
+    if (traverse(state, path, renderMetadata))
     {
-        if (FFlag::LuauNewOverloadResolver && state.encounteredErrorSuppression)
+        if (state.encounteredErrorSuppression)
             return builtinTypes->errorType;
         return state.current;
     }
@@ -1104,10 +1302,16 @@ std::optional<TypeOrPack> traverse(const TypePackId root, const Path& path, cons
         return std::nullopt;
 }
 
-std::optional<TypeOrPack> traverse(const TypeId root, const Path& path, const NotNull<BuiltinTypes> builtinTypes, const NotNull<TypeArena> arena)
+std::optional<TypeOrPack> traverse(
+    const TypeId root,
+    const Path& path,
+    const NotNull<BuiltinTypes> builtinTypes,
+    const NotNull<TypeArena> arena,
+    TypePathRenderMetadata* renderMetadata
+)
 {
     TraversalState state(follow(root), builtinTypes, arena);
-    if (traverse(state, path))
+    if (traverse(state, path, renderMetadata))
         return state.current;
     else
         return std::nullopt;
@@ -1118,7 +1322,7 @@ std::optional<TypeId> traverseForType(const TypeId root, const Path& path, const
     TraversalState state(follow(root), builtinTypes, arena);
     if (traverse(state, path))
     {
-        if (FFlag::LuauConsiderErrorSuppressionInTypes && state.encounteredErrorSuppression)
+        if (state.encounteredErrorSuppression)
             return builtinTypes->errorType;
 
         const TypeId* ty = get<TypeId>(state.current);
@@ -1138,7 +1342,7 @@ std::optional<TypeId> traverseForType(
     TraversalState state(follow(root), builtinTypes, arena);
     if (traverse(state, path))
     {
-        if (FFlag::LuauConsiderErrorSuppressionInTypes && state.encounteredErrorSuppression)
+        if (state.encounteredErrorSuppression)
             return builtinTypes->errorType;
         const TypeId* ty = get<TypeId>(state.current);
         return ty ? std::make_optional(*ty) : std::nullopt;
@@ -1157,7 +1361,7 @@ std::optional<TypePackId> traverseForPack(
     TraversalState state(follow(root), builtinTypes, arena);
     if (traverse(state, path))
     {
-        if (FFlag::LuauConsiderErrorSuppressionInTypes && state.encounteredErrorSuppression)
+        if (state.encounteredErrorSuppression)
             return builtinTypes->errorTypePack;
         const TypePackId* ty = get<TypePackId>(state.current);
         return ty ? std::make_optional(*ty) : std::nullopt;
@@ -1176,7 +1380,7 @@ std::optional<TypePackId> traverseForPack(
     TraversalState state(follow(root), builtinTypes, arena);
     if (traverse(state, path))
     {
-        if (FFlag::LuauConsiderErrorSuppressionInTypes && state.encounteredErrorSuppression)
+        if (state.encounteredErrorSuppression)
             return builtinTypes->errorTypePack;
         const TypePackId* ty = get<TypePackId>(state.current);
         return ty ? std::make_optional(*ty) : std::nullopt;

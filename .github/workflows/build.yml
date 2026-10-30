@@ -30,7 +30,7 @@ jobs:
             addrsize: "64"
           - os: {name: ubuntu, version: ubuntu-latest}
             addrsize: "64"
-            cflags: "-DHARDSTACKTESTS=1"
+            cflags: "-DHARDSTACKTESTS=2"
           - os: {name: ubuntu-32bit, version: ubuntu-latest}
             addrsize: "32"
             cflags: "-msse3 -mfpmath=sse -D_TIME_BITS=64 -D_FILE_OFFSET_BITS=64"
@@ -41,18 +41,6 @@ jobs:
     - name: work around ASLR+ASAN compatibility
       run: sudo sysctl -w vm.mmap_rnd_bits=28
       if: matrix.os.name == 'ubuntu' || matrix.os.name == 'ubuntu-32bit'
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: "3.11"
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip setuptools wheel 'autobuild<4' setuptools_scm
-    - name: Autobuild install
-      env:
-        AUTOBUILD_GITHUB_TOKEN: ${{ secrets.SHARED_AUTOBUILD_GITHUB_TOKEN }}
-      run: |
-        autobuild install -A${{matrix.addrsize}}
     - name: install 32-bit dependencies
       if: matrix.os.name == 'ubuntu-32bit'
       run: |
@@ -60,26 +48,38 @@ jobs:
         sudo apt-get install g++-multilib
     - name: make tests
       run: |
-        LDFLAGS=-m${{matrix.addrsize}} CXXFLAGS="-m${{matrix.addrsize}} ${{matrix.cflags}}" CFLAGS="-m${{matrix.addrsize}} ${{matrix.cflags}}" make -j4 config=sanitize ${{ matrix.addrsize == '64' && 'native=1' || ''}} luau-tests
+        LDFLAGS=-m${{matrix.addrsize}} CXXFLAGS="-m${{matrix.addrsize}} ${{matrix.cflags}}" CFLAGS="-m${{matrix.addrsize}} ${{matrix.cflags}}" make -j4 config=sanitize ${{ matrix.addrsize == '64' && 'native=1' || ''}} slua-tests
     - name: run tests
+      env:
+        # 32-bit ASAN has a much more limited memory space. If the quarantine zone eats up tons of memory,
+        # we don't have much to work with for our actual tests. Reduce the quarantine zone size
+        # for 32-bit specifically.
+        ASAN_OPTIONS: ${{ matrix.os.name == 'ubuntu-32bit' && 'quarantine_size_mb=64' || '' }}
       run: |
-        ./luau-tests
-        ./luau-tests --fflags=true
+        ./slua-tests
+        ./slua-tests --fflags=true
     - name: run extra conformance tests
       if: matrix.os.name != 'ubuntu-32bit'
       run: |
-        ./luau-tests -ts=Conformance -O2
-        ./luau-tests -ts=Conformance -O2 --fflags=true
-        ./luau-tests -ts=Conformance --codegen
-        ./luau-tests -ts=Conformance --codegen --fflags=true
-        ./luau-tests -ts=Conformance --codegen -O2
-        ./luau-tests -ts=Conformance --codegen -O2 --fflags=true
+        ./slua-tests -ts=Conformance -O2
+        ./slua-tests -ts=Conformance -O2 --fflags=true
+        ./slua-tests -ts=Conformance --codegen
+        ./slua-tests -ts=Conformance --codegen --fflags=true
+        ./slua-tests -ts=Conformance --codegen -O2
+        ./slua-tests -ts=Conformance --codegen -O2 --fflags=true
     - name: make cli
       run: |
-         LDFLAGS=-m${{matrix.addrsize}} CXXFLAGS="-m${{matrix.addrsize}} ${{matrix.cflags}} -DHARDSTACKTESTS=1" CFLAGS="-m${{matrix.addrsize}} ${{matrix.cflags}}" make -j4 config=sanitize ${{ matrix.addrsize == '64' && 'native=1' || ''}} werror=1 luau luau-analyze luau-compile # match config with tests to improve build time
-         ./luau tests/conformance/assert.luau
-         ./luau-analyze tests/conformance/assert.luau
-         ./luau-compile tests/conformance/assert.luau
+         LDFLAGS=-m${{matrix.addrsize}} CXXFLAGS="-m${{matrix.addrsize}} ${{matrix.cflags}}" CFLAGS="-m${{matrix.addrsize}} ${{matrix.cflags}}" make -j4 config=sanitize ${{ matrix.addrsize == '64' && 'native=1' || ''}} werror=1 slua slua-analyze slua-compile # match config with tests to improve build time
+         ./slua tests/conformance/assert.luau
+         ./slua-analyze tests/conformance/assert.luau
+         ./slua-compile tests/conformance/assert.luau
+    # ServerLua: scoped to SLExecutor since TSan is slow and the threading lives there
+    - name: run SLExecutor tests under TSan
+      if: matrix.os.name == 'ubuntu'
+      run: |
+        make -j4 config=tsan slua-tests
+        ./build/tsan/slua-tests -ts=SLExecutor
+        ./build/tsan/slua-tests -ts=SLExecutor --fflags=true
 
   windows:
     runs-on: windows-2022
@@ -88,18 +88,8 @@ jobs:
         arch: [x64]
     steps:
       - uses: actions/checkout@v1
-      - name: Set up Python
-        uses: actions/setup-python@v2
-        with:
-          python-version: "3.11"
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip setuptools wheel 'autobuild<4' setuptools_scm
-      - name: Autobuild install
-        run: |
-          autobuild install -A64
       - name: cmake configure
-        run: cmake . -A x64 -DLUAU_WERROR=OFF -DLUAU_NATIVE=ON -DLUAU_USE_TAILSLIDE=ON
+        run: cmake . -A x64 -DLUAU_WERROR=OFF -DLUAU_NATIVE=ON
       - name: cmake build
         run: cmake --build . --target Luau.UnitTest Luau.Conformance --config RelWithDebInfo
       - name: run tests
@@ -113,18 +103,54 @@ jobs:
         shell: bash # necessary for fail-fast
         run: |
           RelWithDebInfo/Luau.Conformance.exe -O2
-          RelWithDebInfo/Luau.Conformance.exe -O2 --fflags=true
-          RelWithDebInfo/Luau.Conformance.exe --codegen
+          # ServerLua: Some of these disabled due to extremely long runtime
+          # RelWithDebInfo/Luau.Conformance.exe -O2 --fflags=true
+          # RelWithDebInfo/Luau.Conformance.exe --codegen
           RelWithDebInfo/Luau.Conformance.exe --codegen --fflags=true
-          RelWithDebInfo/Luau.Conformance.exe --codegen -O2
-          RelWithDebInfo/Luau.Conformance.exe --codegen -O2 --fflags=true
+          # RelWithDebInfo/Luau.Conformance.exe --codegen -O2
+          # RelWithDebInfo/Luau.Conformance.exe --codegen -O2 --fflags=true
       - name: cmake cli
         shell: bash # necessary for fail-fast
         run: |
           cmake --build . --target Luau.Repl.CLI Luau.Analyze.CLI Luau.Compile.CLI --config RelWithDebInfo # match config with tests to improve build time
-          RelWithDebInfo/luau tests/conformance/assert.luau
-          RelWithDebInfo/luau-analyze tests/conformance/assert.luau
-          RelWithDebInfo/luau-compile tests/conformance/assert.luau
+          RelWithDebInfo/slua tests/conformance/assert.luau
+          RelWithDebInfo/slua-analyze tests/conformance/assert.luau
+          RelWithDebInfo/slua-compile tests/conformance/assert.luau
+
+# ServerLua: We don't care about any of these. Sorry.
+
+#  configurations:
+#    strategy:
+#      matrix:
+#        config:
+#          - name: LongJmp
+#            flags: "-DLUA_USE_LONGJMP=1"
+#            codegen: true
+#          - name: Vector4
+#            flags: "-DLUA_VECTOR_SIZE=4"
+#            codegen: false
+#          - name: VectorDouble
+#            flags: "-DLUA_VECTOR_DOUBLE=1"
+#            codegen: false
+#    name: run extra configuration (${{matrix.config.name}})
+#    runs-on: ubuntu-latest
+#    steps:
+#    - uses: actions/checkout@v1
+#    - name: cmake configure
+#      run: cmake . -B build -DCMAKE_BUILD_TYPE=Debug -DLUAU_WERROR=ON -DCMAKE_CXX_FLAGS="${{matrix.config.flags}}" -DCMAKE_C_FLAGS="${{matrix.config.flags}}"
+#    - name: cmake build
+#      run: cmake --build build --target Luau.Conformance --config Debug -j2
+#    - name: run tests
+#      run: |
+#        build/Luau.Conformance
+#        build/Luau.Conformance --fflags=true
+#        build/Luau.Conformance -O2
+#        build/Luau.Conformance -O2 --fflags=true
+#    - name: run codegen tests
+#      if: matrix.config.codegen
+#      run: |
+#        build/Luau.Conformance --codegen --fflags=true
+#        build/Luau.Conformance --codegen -O2 --fflags=true
 
   coverage:
     runs-on: ubuntu-22.04
@@ -133,21 +159,21 @@ jobs:
     - name: install
       run: |
         sudo apt install llvm
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: "3.11"
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip setuptools wheel 'autobuild<4' setuptools_scm
-    - name: Autobuild install
-      env:
-        AUTOBUILD_GITHUB_TOKEN: ${{ secrets.SHARED_AUTOBUILD_GITHUB_TOKEN }}
-      run: |
-        autobuild install -A64
     - name: make coverage
+      env:
+        # ServerLua: regenerate the golden fixtures so the dirty-tree check below
+        # catches non-deterministic or stale serialized states
+        LUAU_REGENERATE_FIXTURES: 1
       run: |
         CXX=clang++ make -j2 config=coverage native=1 coverage
+    - name: check for dirty tree
+      run: |
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "ERROR: working tree is dirty after the build and tests"
+          git status --porcelain
+          git diff --stat
+          exit 1
+        fi
 #    - name: upload coverage
 #      uses: codecov/codecov-action@v3
 #      with:

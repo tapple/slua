@@ -12,9 +12,12 @@
 
 using namespace Luau;
 
-LUAU_FASTFLAG(LuauRecursiveTypeParameterRestriction)
-LUAU_FASTFLAG(LuauSolverV2)
-LUAU_FASTFLAG(LuauReduceSetTypeStackPressure)
+LUAU_FASTINT(LuauTypeMaximumStringifierLength)
+LUAU_FASTFLAG(DebugLuauForceOldSolver)
+LUAU_FASTFLAG(DebugLuauParseExactTables)
+LUAU_FASTFLAG(DebugLuauExactTableTypes)
+LUAU_FASTFLAG(LuauExportValueSyntax)
+LUAU_FASTFLAG(DebugLuauWarnOnUnannotatedTopLevelFunctions)
 
 TEST_SUITE_BEGIN("ToString");
 
@@ -23,7 +26,7 @@ TEST_CASE_FIXTURE(Fixture, "primitive")
     CheckResult result = check("local a = nil    local b = 44    local c = 'lalala'    local d = true");
     LUAU_REQUIRE_NO_ERRORS(result);
 
-    if (FFlag::LuauSolverV2)
+    if (!FFlag::DebugLuauForceOldSolver)
         CHECK("nil" == toString(requireType("a")));
     else
     {
@@ -34,6 +37,12 @@ TEST_CASE_FIXTURE(Fixture, "primitive")
     CHECK_EQ("number", toString(requireType("b")));
     CHECK_EQ("string", toString(requireType("c")));
     CHECK_EQ("boolean", toString(requireType("d")));
+}
+
+TEST_CASE_FIXTURE(Fixture, "builtin_top_extern_types")
+{
+    CHECK_EQ("object", toString(getBuiltins()->objectType));
+    CHECK_EQ("class", toString(getBuiltins()->classType));
 }
 
 TEST_CASE_FIXTURE(Fixture, "bound_types")
@@ -83,6 +92,8 @@ TEST_CASE_FIXTURE(Fixture, "named_table")
 
 TEST_CASE_FIXTURE(Fixture, "empty_table")
 {
+    DOES_NOT_PASS_WITH_EXACT_TABLES();
+
     CheckResult result = check(R"(
         local a: {}
     )");
@@ -138,10 +149,29 @@ TEST_CASE_FIXTURE(Fixture, "long_disjunct_of_nil_is_nil_not_question_mark")
 
 TEST_CASE_FIXTURE(Fixture, "metatable")
 {
+    DOES_NOT_PASS_WITH_EXACT_TABLES();
+
     Type table{TypeVariant(TableType())};
     Type metatable{TypeVariant(TableType())};
     Type mtv{TypeVariant(MetatableType{&table, &metatable})};
-    CHECK_EQ("{ @metatable {|  |}, {|  |} }", toString(&mtv));
+    CHECK_EQ("setmetatable<{|  |}, {|  |}>", toString(&mtv));
+}
+
+TEST_CASE_FIXTURE(Fixture, "metatables_are_valid")
+{
+    DOES_NOT_PASS_WITH_EXACT_TABLES();
+
+    ScopedFastFlag sff{FFlag::LuauBetterMetatableStringification, true};
+
+    Type table{TypeVariant(TableType(TableState::Sealed, TypeLevel{}))};
+    Type metatable{TypeVariant(TableType(TableState::Sealed, TypeLevel{}))};
+    Type mtv{TypeVariant(MetatableType{&table, &metatable})};
+
+    ToStringOptions opts;
+    auto tsr = toStringDetailed(&mtv, opts);
+
+    CHECK("setmetatable<{  }, {  }>" == tsr.name);
+    CHECK(!tsr.invalid);
 }
 
 TEST_CASE_FIXTURE(Fixture, "named_metatable")
@@ -195,12 +225,12 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "exhaustive_toString_of_cyclic_table")
     CHECK_EQ(std::string::npos, a.find("CYCLE"));
     CHECK_EQ(std::string::npos, a.find("TRUNCATED"));
 
-    if (FFlag::LuauSolverV2)
+    if (!FFlag::DebugLuauForceOldSolver)
     {
         CHECK(
             "t2 where "
             "t1 = { __index: t1, __mul: ((t2, number) -> t2) & ((t2, t2) -> t2), new: () -> t2 } ; "
-            "t2 = { @metatable t1, { x: number, y: number, z: number } }" == a
+            "t2 = setmetatable<{ x: number, y: number, z: number }, t1>" == a
         );
     }
     else
@@ -208,7 +238,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "exhaustive_toString_of_cyclic_table")
         CHECK_EQ(
             "t2 where "
             "t1 = {| __index: t1, __mul: ((t2, number) -> t2) & ((t2, t2) -> t2), new: () -> t2 |} ; "
-            "t2 = { @metatable t1, { x: number, y: number, z: number } }",
+            "t2 = setmetatable<{ x: number, y: number, z: number }, t1>",
             a
         );
     }
@@ -358,7 +388,10 @@ TEST_CASE_FIXTURE(Fixture, "quit_stringifying_type_when_length_is_exceeded")
         function f2(f) return f or f1 end
         function f3(f) return f or f2 end
     )");
-    if (FFlag::LuauSolverV2)
+
+    ignoreMissingAnnotations(result);
+
+    if (!FFlag::DebugLuauForceOldSolver)
     {
         LUAU_REQUIRE_NO_ERRORS(result);
 
@@ -366,9 +399,9 @@ TEST_CASE_FIXTURE(Fixture, "quit_stringifying_type_when_length_is_exceeded")
         o.exhaustive = false;
         o.maxTypeLength = 20;
         CHECK_EQ(toString(requireType("f0"), o), "() -> ()");
-        CHECK_EQ(toString(requireType("f1"), o), "<a>(a) -> (() -> ()) ... *TRUNCATED*");
-        CHECK_EQ(toString(requireType("f2"), o), "<b>(b) -> (<a>(a) -> (() -> ())... *TRUNCATED*");
-        CHECK_EQ(toString(requireType("f3"), o), "<c>(c) -> (<b>(b) -> (<a>(a) -> (() -> ())... *TRUNCATED*");
+        CHECK_EQ(toString(requireType("f1"), o), "<T>(T) -> (() -> ()) ... *TRUNCATED*");
+        CHECK_EQ(toString(requireType("f2"), o), "<U>(U) -> (<T>(T) -> (() -> ())... *TRUNCATED*");
+        CHECK_EQ(toString(requireType("f3"), o), "<V>(V) -> (<U>(U) -> (<T>(T) -> (() -> ())... *TRUNCATED*");
     }
     else
     {
@@ -393,7 +426,9 @@ TEST_CASE_FIXTURE(Fixture, "stringifying_type_is_still_capped_when_exhaustive")
         function f3(f) return f or f2 end
     )");
 
-    if (FFlag::LuauSolverV2)
+    ignoreMissingAnnotations(result);
+
+    if (!FFlag::DebugLuauForceOldSolver)
     {
         LUAU_REQUIRE_NO_ERRORS(result);
 
@@ -401,9 +436,9 @@ TEST_CASE_FIXTURE(Fixture, "stringifying_type_is_still_capped_when_exhaustive")
         o.exhaustive = true;
         o.maxTypeLength = 20;
         CHECK_EQ(toString(requireType("f0"), o), "() -> ()");
-        CHECK_EQ(toString(requireType("f1"), o), "<a>(a) -> (() -> ()) ... *TRUNCATED*");
-        CHECK_EQ(toString(requireType("f2"), o), "<b>(b) -> (<a>(a) -> (() -> ())... *TRUNCATED*");
-        CHECK_EQ(toString(requireType("f3"), o), "<c>(c) -> (<b>(b) -> (<a>(a) -> (() -> ())... *TRUNCATED*");
+        CHECK_EQ(toString(requireType("f1"), o), "<T>(T) -> (() -> ()) ... *TRUNCATED*");
+        CHECK_EQ(toString(requireType("f2"), o), "<U>(U) -> (<T>(T) -> (() -> ())... *TRUNCATED*");
+        CHECK_EQ(toString(requireType("f3"), o), "<V>(V) -> (<U>(U) -> (<T>(T) -> (() -> ())... *TRUNCATED*");
     }
     else
     {
@@ -421,6 +456,8 @@ TEST_CASE_FIXTURE(Fixture, "stringifying_type_is_still_capped_when_exhaustive")
 
 TEST_CASE_FIXTURE(Fixture, "stringifying_table_type_correctly_use_matching_table_state_braces")
 {
+    DOES_NOT_PASS_WITH_EXACT_TABLES();
+
     TableType ttv{TableState::Sealed, TypeLevel{}};
     for (char c : std::string("abcdefghij"))
         ttv.props[std::string(1, c)] = {getBuiltins()->numberType};
@@ -454,6 +491,8 @@ TEST_CASE_FIXTURE(Fixture, "stringifying_cyclic_intersection_type_bails_early")
 
 TEST_CASE_FIXTURE(Fixture, "stringifying_array_uses_array_syntax")
 {
+    DOES_NOT_PASS_WITH_EXACT_TABLES();
+
     TableType ttv{TableState::Sealed, TypeLevel{}};
     ttv.indexer = TableIndexer{getBuiltins()->numberType, getBuiltins()->stringType};
 
@@ -482,7 +521,7 @@ TEST_CASE_FIXTURE(Fixture, "generic_packs_are_stringified_differently_from_gener
     TypePackVar tpv{GenericTypePack{"a"}};
     CHECK_EQ(toString(&tpv), "a...");
 
-    Type tv{GenericType{"a"}};
+    Type tv{GenericType{"a", Polarity::Mixed}};
     CHECK_EQ(toString(&tv), "a");
 }
 
@@ -516,6 +555,9 @@ type Table = typeof(tbl)
 type Foo = typeof(tbl.foo)
 local u: Foo
 )");
+
+    ignoreMissingAnnotations(result);
+
     LUAU_REQUIRE_NO_ERRORS(result);
 
     ToStringOptions opts;
@@ -534,14 +576,16 @@ TEST_CASE_FIXTURE(Fixture, "generate_friendly_names_for_inferred_generics")
         end
     )");
 
+    ignoreMissingAnnotations(result);
+
     LUAU_REQUIRE_NO_ERRORS(result);
 
-    CHECK_EQ("<a>(a) -> a", toString(requireType("id")));
+    CHECK_EQ("<T>(T) -> T", toString(requireType("id")));
 
     CHECK_EQ(
-        "<a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, a1, b1, c1, d1>(a, b, c, d, e, f, g, h, i, j, k, l, "
-        "m, n, o, p, q, r, s, t, u, v, w, x, y, z, a1, b1, c1, d1) -> (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, "
-        "x, y, z, a1, b1, c1, d1)",
+        "<T, U, V, W, X, Y, Z, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T1, U1, V1, W1>(T, U, V, W, X, Y, Z, A, B, C, D, E, F, "
+        "G, H, I, J, K, L, M, N, O, P, Q, R, S, T1, U1, V1, W1) -> (T, U, V, W, X, Y, Z, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, "
+        "R, S, T1, U1, V1, W1)",
         toString(requireType("id2"))
     );
 }
@@ -554,6 +598,8 @@ TEST_CASE_FIXTURE(Fixture, "toStringDetailed")
         end
     )");
 
+    ignoreMissingAnnotations(result);
+
     LUAU_REQUIRE_NO_ERRORS(result);
 
     ToStringOptions opts;
@@ -563,7 +609,7 @@ TEST_CASE_FIXTURE(Fixture, "toStringDetailed")
 
     REQUIRE(3 == opts.nameMap.types.size());
 
-    REQUIRE_EQ("<a, b, c>(a, b, c) -> (a, b, c)", nameData.name);
+    REQUIRE_EQ("<T, U, V>(T, U, V) -> (T, U, V)", nameData.name);
 
     const FunctionType* ftv = get<FunctionType>(follow(id3Type));
     REQUIRE(ftv != nullptr);
@@ -571,15 +617,13 @@ TEST_CASE_FIXTURE(Fixture, "toStringDetailed")
     auto params = flatten(ftv->argTypes).first;
     REQUIRE(3 == params.size());
 
-    CHECK("a" == toString(params[0], opts));
-    CHECK("b" == toString(params[1], opts));
-    CHECK("c" == toString(params[2], opts));
+    CHECK("T" == toString(params[0], opts));
+    CHECK("U" == toString(params[1], opts));
+    CHECK("V" == toString(params[2], opts));
 }
 
 TEST_CASE_FIXTURE(Fixture, "toStringErrorPack")
 {
-    DOES_NOT_PASS_NEW_SOLVER_GUARD();
-
     CheckResult result = check(R"(
 local function target(callback: nil) return callback(4, "hello") end
     )");
@@ -594,12 +638,16 @@ TEST_CASE_FIXTURE(Fixture, "toStringGenericPack")
 function foo(a, b) return a(b) end
     )");
 
+    ignoreMissingAnnotations(result);
+
     LUAU_REQUIRE_NO_ERRORS(result);
-    CHECK_EQ(toString(requireType("foo")), "<a, b...>((a) -> (b...), a) -> (b...)");
+    CHECK_EQ(toString(requireType("foo")), "<T, U...>((T) -> (U...), T) -> (U...)");
 }
 
 TEST_CASE_FIXTURE(Fixture, "toString_the_boundTo_table_type_contained_within_a_TypePack")
 {
+    DOES_NOT_PASS_WITH_EXACT_TABLES();
+
     Type tv1{TableType{}};
     TableType* ttv = getMutable<TableType>(&tv1);
     ttv->state = TableState::Sealed;
@@ -642,6 +690,8 @@ TEST_CASE_FIXTURE(Fixture, "no_parentheses_around_cyclic_function_type_in_union"
         local g: F = f
     )");
 
+    ignoreMissingAnnotations(result);
+
     LUAU_REQUIRE_NO_ERRORS(result);
 
     CHECK_EQ("t1 where t1 = ((() -> number)?) -> t1?", toString(requireType("g")));
@@ -649,12 +699,12 @@ TEST_CASE_FIXTURE(Fixture, "no_parentheses_around_cyclic_function_type_in_union"
 
 TEST_CASE_FIXTURE(Fixture, "no_parentheses_around_cyclic_function_type_in_intersection")
 {
-    ScopedFastFlag sff{FFlag::LuauReduceSetTypeStackPressure, true};
-
     CheckResult result = check(R"(
         function f() return f end
         local a: ((number) -> ()) & typeof(f)
     )");
+
+    ignoreMissingAnnotations(result);
 
     LUAU_REQUIRE_NO_ERRORS(result);
 
@@ -680,11 +730,13 @@ TEST_CASE_FIXTURE(Fixture, "toStringNamedFunction_id")
     TypeId ty = requireType("id");
     const FunctionType* ftv = get<FunctionType>(follow(ty));
 
-    CHECK_EQ("id<a>(x: a): a", toStringNamedFunction("id", *ftv));
+    CHECK_EQ("id<T>(x: T): T", toStringNamedFunction("id", *ftv));
 }
 
 TEST_CASE_FIXTURE(Fixture, "toStringNamedFunction_map")
 {
+    DOES_NOT_PASS_WITH_EXACT_TABLES();
+
     CheckResult result = check(R"(
         local function map(arr, fn)
             local t = {}
@@ -698,10 +750,10 @@ TEST_CASE_FIXTURE(Fixture, "toStringNamedFunction_map")
     TypeId ty = requireType("map");
     const FunctionType* ftv = get<FunctionType>(follow(ty));
 
-    if (FFlag::LuauSolverV2)
-        CHECK_EQ("map<a, b>(arr: {a}, fn: (a) -> (b, ...unknown)): {b}", toStringNamedFunction("map", *ftv));
+    if (!FFlag::DebugLuauForceOldSolver)
+        CHECK_EQ("map<T, U>(arr: {T}, fn: (T) -> (U, ...unknown)): {U}", toStringNamedFunction("map", *ftv));
     else
-        CHECK_EQ("map<a, b>(arr: {a}, fn: (a) -> b): {b}", toStringNamedFunction("map", *ftv));
+        CHECK_EQ("map<T, U>(arr: {T}, fn: (T) -> U): {U}", toStringNamedFunction("map", *ftv));
 }
 
 TEST_CASE_FIXTURE(Fixture, "toStringNamedFunction_generic_pack")
@@ -807,7 +859,7 @@ TEST_CASE_FIXTURE(Fixture, "toStringNamedFunction_overrides_param_names")
 
     ToStringOptions opts;
     opts.namedFunctionOverrideArgNames = {"first", "second", "third"};
-    CHECK_EQ("test<a>(first: a, second: string, ...: number): a", toStringNamedFunction("test", *ftv, opts));
+    CHECK_EQ("test<T>(first: T, second: string, ...: number): T", toStringNamedFunction("test", *ftv, opts));
 }
 
 TEST_CASE_FIXTURE(Fixture, "pick_distinct_names_for_mixed_explicit_and_implicit_generics")
@@ -816,12 +868,12 @@ TEST_CASE_FIXTURE(Fixture, "pick_distinct_names_for_mixed_explicit_and_implicit_
         function foo<a>(x: a, y) end
     )");
 
-    if (FFlag::LuauSolverV2)
+    if (!FFlag::DebugLuauForceOldSolver)
     {
         CHECK("<a>(a, unknown) -> ()" == toString(requireType("foo")));
     }
     else
-        CHECK("<a, b>(a, b) -> ()" == toString(requireType("foo")));
+        CHECK("<a, U>(a, U) -> ()" == toString(requireType("foo")));
 }
 
 TEST_CASE_FIXTURE(Fixture, "tostring_unsee_ttv_if_array")
@@ -848,27 +900,26 @@ TEST_CASE_FIXTURE(Fixture, "tostring_error_mismatch")
     )");
 
     std::string expected;
-    if (FFlag::LuauSolverV2)
-        expected = "Type\n\t"
-                   "'{ a: number, b: string, c: { d: string } }'\n"
-                   "could not be converted into\n\t"
-                   "'{ a: number, b: string, c: { d: number } }'; \n"
-                   "this is because accessing `c.d` results in `string` in the former type and `number` in the latter "
-                   "type, and `string` is not exactly `number`";
-    else
-        expected = "Type\n\t"
-                   "'{ a: number, b: string, c: { d: string } }'\n"
-                   "could not be converted into\n\t"
+    if (!FFlag::DebugLuauForceOldSolver)
+        expected = "Expected this to be\n\t"
                    "'{ a: number, b: string, c: { d: number } }'\n"
+                   "but got\n\t"
+                   "'{ a: number, b: string, c: { d: string } }'; \n"
+                   "Expected property `c.d` to be exactly `number`, but got `string`";
+    else
+        expected = "Expected this to be exactly\n\t"
+                   "'{ a: number, b: string, c: { d: number } }'\n"
+                   "but got\n\t"
+                   "'{ a: number, b: string, c: { d: string } }'\n"
                    "caused by:\n  "
                    "Property 'c' is not compatible.\n"
-                   "Type\n\t"
-                   "'{ d: string }'\n"
-                   "could not be converted into\n\t"
+                   "Expected this to be exactly\n\t"
                    "'{ d: number }'\n"
+                   "but got\n\t"
+                   "'{ d: string }'\n"
                    "caused by:\n  "
                    "Property 'd' is not compatible.\n"
-                   "Type 'string' could not be converted into 'number' in an invariant context";
+                   "Expected this to be exactly 'number', but got 'string'";
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
     std::string actual = toString(result.errors[0]);
@@ -878,7 +929,7 @@ TEST_CASE_FIXTURE(Fixture, "tostring_error_mismatch")
 TEST_CASE_FIXTURE(Fixture, "checked_fn_toString")
 {
     ScopedFastFlag flags[] = {
-        {FFlag::LuauSolverV2, true},
+        {FFlag::DebugLuauForceOldSolver, false},
     };
 
     auto _result = loadDefinition(R"(
@@ -897,7 +948,7 @@ local f = abs
 
 TEST_CASE_FIXTURE(Fixture, "read_only_properties")
 {
-    ScopedFastFlag sff{FFlag::LuauSolverV2, true};
+    ScopedFastFlag sff{FFlag::DebugLuauForceOldSolver, false};
 
     CheckResult result = check(R"(
         type A = {x: string}
@@ -912,6 +963,8 @@ TEST_CASE_FIXTURE(Fixture, "read_only_properties")
 
 TEST_CASE_FIXTURE(Fixture, "cycle_rooted_in_a_pack")
 {
+    DOES_NOT_PASS_WITH_EXACT_TABLES();
+
     TypeArena arena;
 
     TypePackId thePack = arena.addTypePack({getBuiltins()->numberType, getBuiltins()->numberType});
@@ -943,8 +996,392 @@ TEST_CASE_FIXTURE(Fixture, "correct_stringification_user_defined_type_functions"
 
     Type tv{tftt};
 
-    if (FFlag::LuauSolverV2)
+    if (!FFlag::DebugLuauForceOldSolver)
         CHECK_EQ(toString(&tv, {}), "woohoo<number>");
+}
+
+TEST_CASE_FIXTURE(Fixture, "record_type_compositions_table")
+{
+    CheckResult checkResult = check(R"(
+        type Table = {}
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(checkResult);
+
+    ToStringOptions opts;
+
+    TypeId ty = requireTypeAlias("Table");
+    ToStringResult result = toStringDetailed(ty, opts);
+
+    REQUIRE_EQ(result.typeSpans.size(), 1);
+
+    auto [startPos, endPos, recordedTy] = result.typeSpans[0];
+    CHECK_EQ(startPos, 0);
+    CHECK_EQ(endPos, 5);
+    CHECK_EQ(recordedTy, ty);
+}
+
+TEST_CASE_FIXTURE(Fixture, "record_type_compositions_union_intersection")
+{
+    CheckResult checkResult = check(R"(
+        type TableA = {}
+        type TableB = {}
+
+        type Composite1 = TableA | TableB
+        type Composite2 = TableA & TableB
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(checkResult);
+
+    ToStringOptions opts;
+
+    for (const auto& aliasName : {"Composite1", "Composite2"})
+    {
+        TypeId ty = requireTypeAlias(aliasName);
+        ToStringResult result = toStringDetailed(ty, opts);
+
+        REQUIRE_EQ(result.typeSpans.size(), 2);
+
+        auto [startPosA, endPosA, recordedTyA] = result.typeSpans[0];
+        CHECK_EQ(startPosA, 0);
+        CHECK_EQ(endPosA, 6);
+        CHECK_EQ(recordedTyA, requireTypeAlias("TableA"));
+
+        auto [startPosB, endPosB, recordedTyB] = result.typeSpans[1];
+        CHECK_EQ(startPosB, 9);
+        CHECK_EQ(endPosB, 15);
+        CHECK_EQ(recordedTyB, requireTypeAlias("TableB"));
+    }
+}
+
+TEST_CASE_FIXTURE(Fixture, "record_type_compositions_union_handle_resorted_results")
+{
+    CheckResult checkResult = check(R"(
+        type Zebra = {}
+        type Alpha = {}
+
+        type Composite = Zebra | Alpha
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(checkResult);
+
+    ToStringOptions opts;
+
+    TypeId ty = requireTypeAlias("Composite");
+    ToStringResult result = toStringDetailed(ty, opts);
+
+    CHECK_EQ(result.name, "Alpha | Zebra");
+
+    REQUIRE_EQ(result.typeSpans.size(), 2);
+
+    auto [startPosAlpha, endPosAlpha, recordedTyAlpha] = result.typeSpans[0];
+    CHECK_EQ(startPosAlpha, 0);
+    CHECK_EQ(endPosAlpha, 5);
+    CHECK_EQ(recordedTyAlpha, requireTypeAlias("Alpha"));
+
+    auto [startPosZebra, endPosZebra, recordedTyZebra] = result.typeSpans[1];
+    CHECK_EQ(startPosZebra, 8);
+    CHECK_EQ(endPosZebra, 13);
+    CHECK_EQ(recordedTyZebra, requireTypeAlias("Zebra"));
+}
+
+
+TEST_CASE_FIXTURE(Fixture, "record_type_compositions_generic")
+{
+    CheckResult checkResult = check(R"(
+        type Object = {}
+        type Box<T> = { inner: T }
+
+        local x: Box<Object>
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(checkResult);
+
+    ToStringOptions opts;
+
+    TypeId ty = requireType("x");
+    ToStringResult result = toStringDetailed(ty, opts);
+
+    REQUIRE_EQ(result.typeSpans.size(), 2);
+
+    auto [startPosBox, endPosBox, recordedTyBox] = result.typeSpans[0];
+    CHECK_EQ(startPosBox, 0);
+    CHECK_EQ(endPosBox, 3);
+    CHECK_EQ(recordedTyBox, ty);
+
+    auto [startPosObject, endPosObject, recordedTyObject] = result.typeSpans[1];
+    CHECK_EQ(startPosObject, 4);
+    CHECK_EQ(endPosObject, 10);
+    CHECK_EQ(recordedTyObject, requireTypeAlias("Object"));
+}
+
+TEST_CASE_FIXTURE(Fixture, "empty_tables")
+{
+    TypeId emptyExact = arena.addType(TableType{TableState::Exact, TypeLevel{}});
+    TypeId emptyInexact = arena.addType(TableType{TableState::Sealed, TypeLevel{}});
+    TypeId emptyUnsealed = arena.addType(TableType{TableState::Unsealed, TypeLevel{}});
+    TypeId emptyFree = arena.addType(TableType{TableState::Free, TypeLevel{}});
+    TypeId emptyGeneric = arena.addType(TableType{TableState::Generic, TypeLevel{}});
+
+    SUBCASE("flags_off")
+    {
+        ScopedFastFlag sff[] = {
+            {FFlag::DebugLuauParseExactTables, false},
+            {FFlag::DebugLuauExactTableTypes, false},
+        };
+
+        CHECK("{  }" == toString(emptyInexact));
+        CHECK("{  }" == toString(emptyExact));
+        CHECK("{|  |}" == toString(emptyUnsealed));
+        CHECK("{-  -}" == toString(emptyFree));
+        CHECK("{+  +}" == toString(emptyGeneric));
+    }
+
+    SUBCASE("flags_on")
+    {
+        ScopedFastFlag sff[] = {
+            {FFlag::DebugLuauParseExactTables, true},
+            {FFlag::DebugLuauExactTableTypes, true},
+        };
+        CHECK("{ ... }" == toString(emptyInexact));
+        CHECK("{ }" == toString(emptyExact));
+        CHECK("{| |}" == toString(emptyUnsealed));
+        CHECK("{- -}" == toString(emptyFree));
+        CHECK("{+ +}" == toString(emptyGeneric));
+    }
+}
+
+TEST_CASE_FIXTURE(Fixture, "tables_with_indexers_and_props")
+{
+    TableType::Props xProp{{"x", getBuiltins()->numberType}};
+    TableIndexer stringIndexer{getBuiltins()->stringType, getBuiltins()->numberType};
+    TableIndexer numberIndexer{getBuiltins()->numberType, getBuiltins()->stringType};
+    TableIndexer readOnlyStringIndexer{getBuiltins()->stringType, getBuiltins()->numberType, true};
+
+    TypeId sealedStrIdx = arena.addType(TableType{{}, stringIndexer, TypeLevel{}, TableState::Sealed});
+    TypeId exactStrIdx = arena.addType(TableType{{}, stringIndexer, TypeLevel{}, TableState::Exact});
+
+    TypeId sealedProps = arena.addType(TableType{xProp, std::nullopt, TypeLevel{}, TableState::Sealed});
+    TypeId exactProps = arena.addType(TableType{xProp, std::nullopt, TypeLevel{}, TableState::Exact});
+
+    TypeId sealedBoth = arena.addType(TableType{xProp, stringIndexer, TypeLevel{}, TableState::Sealed});
+    TypeId exactBoth = arena.addType(TableType{xProp, stringIndexer, TypeLevel{}, TableState::Exact});
+    TypeId unsealedBoth = arena.addType(TableType{xProp, stringIndexer, TypeLevel{}, TableState::Unsealed});
+
+    TypeId sealedNumIdxProps = arena.addType(TableType{xProp, numberIndexer, TypeLevel{}, TableState::Sealed});
+    TypeId exactNumIdxProps = arena.addType(TableType{xProp, numberIndexer, TypeLevel{}, TableState::Exact});
+
+    TypeId sealedNumIdx = arena.addType(TableType{{}, numberIndexer, TypeLevel{}, TableState::Sealed});
+    TypeId exactNumIdx = arena.addType(TableType{{}, numberIndexer, TypeLevel{}, TableState::Exact});
+
+    TypeId sealedReadOnlyStrIdx = arena.addType(TableType{{}, readOnlyStringIndexer, TypeLevel{}, TableState::Sealed});
+    TypeId exactReadOnlyStrIdx = arena.addType(TableType{{}, readOnlyStringIndexer, TypeLevel{}, TableState::Exact});
+
+    SUBCASE("flags_off")
+    {
+        ScopedFastFlag sff[] = {
+            {FFlag::DebugLuauParseExactTables, false},
+            {FFlag::DebugLuauExactTableTypes, false},
+        };
+
+        CHECK("{ [string]: number }" == toString(sealedStrIdx));
+        CHECK("{ [string]: number }" == toString(exactStrIdx));
+
+        CHECK("{ x: number }" == toString(sealedProps));
+        CHECK("{ x: number }" == toString(exactProps));
+
+        CHECK("{ [string]: number, x: number }" == toString(sealedBoth));
+        CHECK("{ [string]: number, x: number }" == toString(exactBoth));
+        CHECK("{| [string]: number, x: number |}" == toString(unsealedBoth));
+
+        CHECK("{ [number]: string, x: number }" == toString(sealedNumIdxProps));
+        CHECK("{ [number]: string, x: number }" == toString(exactNumIdxProps));
+
+        CHECK("{string}" == toString(sealedNumIdx));
+        CHECK("{string}" == toString(exactNumIdx));
+
+        CHECK("{ read [string]: number }" == toString(sealedReadOnlyStrIdx));
+        CHECK("{ read [string]: number }" == toString(exactReadOnlyStrIdx));
+    }
+
+    SUBCASE("flags_on")
+    {
+        ScopedFastFlag sff[] = {
+            {FFlag::DebugLuauParseExactTables, true},
+            {FFlag::DebugLuauExactTableTypes, true},
+        };
+
+        CHECK("{ [string]: number, ... }" == toString(sealedStrIdx));
+        CHECK("{ [string]: number }" == toString(exactStrIdx));
+
+        CHECK("{ x: number, ... }" == toString(sealedProps));
+        CHECK("{ x: number }" == toString(exactProps));
+
+        CHECK("{ [string]: number, x: number, ... }" == toString(sealedBoth));
+        CHECK("{ [string]: number, x: number }" == toString(exactBoth));
+        CHECK("{| [string]: number, x: number |}" == toString(unsealedBoth));
+
+        CHECK("{ [number]: string, x: number, ... }" == toString(sealedNumIdxProps));
+        CHECK("{ [number]: string, x: number }" == toString(exactNumIdxProps));
+
+        CHECK("{string, ...}" == toString(sealedNumIdx));
+        CHECK("{string}" == toString(exactNumIdx));
+
+        CHECK("{ read [string]: number, ... }" == toString(sealedReadOnlyStrIdx));
+        CHECK("{ read [string]: number }" == toString(exactReadOnlyStrIdx));
+    }
+
+    SUBCASE("flags_on_multiline")
+    {
+        ScopedFastFlag sff[] = {
+            {FFlag::DebugLuauParseExactTables, true},
+            {FFlag::DebugLuauExactTableTypes, true},
+        };
+
+        ToStringOptions opts;
+        opts.useLineBreaks = true;
+
+        CHECK(
+            "{\n"
+            "    [string]: number,\n"
+            "    ...\n"
+            "}" == toString(sealedStrIdx, opts)
+        );
+        CHECK(
+            "{\n"
+            "    [string]: number\n"
+            "}" == toString(exactStrIdx, opts)
+        );
+
+        CHECK(
+            "{\n"
+            "    x: number,\n"
+            "    ...\n"
+            "}" == toString(sealedProps, opts)
+        );
+        CHECK(
+            "{\n"
+            "    x: number\n"
+            "}" == toString(exactProps, opts)
+        );
+
+        CHECK(
+            "{\n"
+            "    [string]: number,\n"
+            "    x: number,\n"
+            "    ...\n"
+            "}" == toString(sealedBoth, opts)
+        );
+        CHECK(
+            "{\n"
+            "    [string]: number,\n"
+            "    x: number\n"
+            "}" == toString(exactBoth, opts)
+        );
+        CHECK(
+            "{|\n"
+            "    [string]: number,\n"
+            "    x: number\n"
+            "|}" == toString(unsealedBoth, opts)
+        );
+
+        CHECK(
+            "{\n"
+            "    [number]: string,\n"
+            "    x: number,\n"
+            "    ...\n"
+            "}" == toString(sealedNumIdxProps, opts)
+        );
+        CHECK(
+            "{\n"
+            "    [number]: string,\n"
+            "    x: number\n"
+            "}" == toString(exactNumIdxProps, opts)
+        );
+
+        CHECK("{string, ...}" == toString(sealedNumIdx, opts));
+        CHECK("{string}" == toString(exactNumIdx, opts));
+
+        CHECK(
+            "{\n"
+            "    read [string]: number,\n"
+            "    ...\n"
+            "}" == toString(sealedReadOnlyStrIdx, opts)
+        );
+        CHECK(
+            "{\n"
+            "    read [string]: number\n"
+            "}" == toString(exactReadOnlyStrIdx, opts)
+        );
+    }
+}
+
+TEST_CASE_FIXTURE(Fixture, "suggest_syntactically_legal_annotation")
+{
+    DOES_NOT_PASS_WITH_EXACT_TABLES();
+
+    DOES_NOT_PASS_OLD_SOLVER_GUARD();
+
+    ScopedFastFlag sff[] = {
+        {FFlag::LuauExportValueSyntax, true},
+        {FFlag::DebugLuauWarnOnUnannotatedTopLevelFunctions, true},
+    };
+
+    CheckResult result = check(R"(
+        export function foo(t)
+            t.x = 10
+        end
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    auto e = findError<TypeAnnotationRequired>(result);
+    REQUIRE(e.has_value());
+    CHECK("Type annotation required here.  Consider (t: { x: number }) -> ()" == toString(*e));
+}
+
+TEST_CASE_FIXTURE(Fixture, "dont_suggest_syntactically_illegal_annotation")
+{
+    DOES_NOT_PASS_OLD_SOLVER_GUARD();
+
+    ScopedFastFlag sff[] = {
+        {FFlag::LuauExportValueSyntax, true},
+        {FFlag::DebugLuauWarnOnUnannotatedTopLevelFunctions, true},
+    };
+
+    CheckResult result = check(R"(
+        export function foo(t)
+            t.x = is_not_defined
+        end
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(2, result);
+    LUAU_REQUIRE_ERROR(result, UnknownSymbol);
+    auto e = findError<TypeAnnotationRequired>(result);
+    REQUIRE(e.has_value());
+    CHECK("Type annotation required here.  Unable to infer the type of this function." == toString(*e));
+}
+
+TEST_CASE_FIXTURE(Fixture, "dont_suggest_type_that_is_too_long")
+{
+    DOES_NOT_PASS_OLD_SOLVER_GUARD();
+
+    ScopedFastFlag sff[] = {
+        {FFlag::LuauExportValueSyntax, true},
+        {FFlag::DebugLuauWarnOnUnannotatedTopLevelFunctions, true},
+    };
+
+    ScopedFastInt sfi{FInt::LuauTypeMaximumStringifierLength, 3};
+
+    CheckResult result = check(R"(
+        export function foo(t)
+            t.x.x.x.x.x.x = true
+        end
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    auto e = findError<TypeAnnotationRequired>(result);
+    REQUIRE(e.has_value());
+    CHECK("Type annotation required here.  Unable to infer the type of this function." == toString(*e));
 }
 
 TEST_SUITE_END();

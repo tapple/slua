@@ -3,7 +3,6 @@
 
 #include "Luau/BuiltinTypeFunctions.h"
 #include "Luau/Config.h"
-#include "Luau/EqSatSimplification.h"
 #include "Luau/Error.h"
 #include "Luau/FileResolver.h"
 #include "Luau/Frontend.h"
@@ -26,15 +25,48 @@
 #include <optional>
 #include <vector>
 
+LUAU_FASTFLAG(LuauBetterMetatableStringification);
+
 LUAU_FASTFLAG(DebugLuauFreezeArena)
 LUAU_FASTFLAG(DebugLuauForceAllNewSolverTests)
+LUAU_FASTFLAG(DebugLuauForceAllOldSolverTests)
+LUAU_FASTFLAG(DebugLuauExactTableTypes)
+LUAU_FASTFLAG(DebugLuauParseExactTables)
+LUAU_FASTFLAG(DebugLuauForceExactTables)
+LUAU_FASTFLAG(DebugLuauRunFailingExactTableTests)
 
-LUAU_FASTFLAG(LuauTidyTypeUtils)
 LUAU_FASTFLAG(DebugLuauAlwaysShowConstraintSolvingIncomplete);
+LUAU_FASTFLAG(DebugLuauForceOldSolver)
+LUAU_FASTFLAG(LuauBetterInferredGenericNames)
+LUAU_FASTFLAG(LuauSplitIceHandler)
 
-#define DOES_NOT_PASS_NEW_SOLVER_GUARD_IMPL(line) ScopedFastFlag sff_##line{FFlag::LuauSolverV2, FFlag::DebugLuauForceAllNewSolverTests};
+#define DOES_NOT_PASS_NEW_SOLVER_GUARD_IMPL(line) ScopedFastFlag sff_##line{FFlag::DebugLuauForceOldSolver, !FFlag::DebugLuauForceAllNewSolverTests};
 
 #define DOES_NOT_PASS_NEW_SOLVER_GUARD() DOES_NOT_PASS_NEW_SOLVER_GUARD_IMPL(__LINE__)
+
+#define DOES_NOT_PASS_OLD_SOLVER_GUARD_IMPL(line) ScopedFastFlag sff_##line{FFlag::DebugLuauForceOldSolver, FFlag::DebugLuauForceAllOldSolverTests};
+
+#define DOES_NOT_PASS_OLD_SOLVER_GUARD() DOES_NOT_PASS_OLD_SOLVER_GUARD_IMPL(__LINE__)
+
+#define LUAU_CONCAT_IMPL(x, y) x##y
+#define LUAU_CONCAT(x, y) LUAU_CONCAT_IMPL(x, y)
+
+#define DOES_NOT_PASS_WITH_EXACT_TABLES() \
+    ScopedFastFlag LUAU_CONCAT(sff_, __COUNTER__){FFlag::DebugLuauExactTableTypes, FFlag::DebugLuauRunFailingExactTableTests}; \
+    ScopedFastFlag LUAU_CONCAT(sff_, __COUNTER__){FFlag::DebugLuauParseExactTables, FFlag::DebugLuauRunFailingExactTableTests}; \
+    ScopedFastFlag LUAU_CONCAT(sff_, __COUNTER__) \
+    { \
+        FFlag::DebugLuauForceExactTables, FFlag::DebugLuauRunFailingExactTableTests \
+    }
+
+// If CALLGRIND is on, then disable the timeout (doctest treats a timeout of 0 as disabled).
+#ifdef CALLGRIND
+constexpr double LUAU_TIMEOUT = 0.0;
+#else
+constexpr double LUAU_TIMEOUT = 4.0;
+#endif
+
+
 
 namespace Luau
 {
@@ -110,6 +142,10 @@ struct TestConfigResolver : ConfigResolver
 struct Fixture
 {
     explicit Fixture(bool prepareAutocomplete = false);
+
+    explicit Fixture(const Fixture&) = delete;
+    Fixture& operator=(const Fixture&) = delete;
+
     ~Fixture();
 
     // Throws Luau::ParseErrors if the parse fails.
@@ -138,22 +174,23 @@ struct Fixture
     TypeId requireType(const ScopePtr& scope, const std::string& name);
 
     std::optional<TypeId> findTypeAtPosition(Position position);
+    std::optional<TypeId> findTypeAtPosition(const ModuleName& moduleName, Position position);
     TypeId requireTypeAtPosition(Position position);
+    TypeId requireTypeAtPosition(const ModuleName& moduleName, Position position);
     std::optional<TypeId> findExpectedTypeAtPosition(Position position);
 
     std::optional<TypeId> lookupType(const std::string& name);
     std::optional<TypeId> lookupImportedType(const std::string& moduleAlias, const std::string& name);
     TypeId requireTypeAlias(const std::string& name);
+    TypeId requireExportedType(const std::string& name);
     TypeId requireExportedType(const ModuleName& moduleName, const std::string& name);
 
-    std::string canonicalize(TypeId ty);
+    TypeId parseType(std::string_view src);
 
     // While most flags can be flipped inside the unit test, some code changes affect the state that is part of Fixture initialization
     // Most often those are changes related to builtin type definitions.
     // In that case, flag can be forced to 'true' using the example below:
     // ScopedFastFlag sff_LuauExampleFlagDefinition{FFlag::LuauExampleFlagDefinition, true};
-
-    ScopedFastFlag sff_TypeUtilTidy{FFlag::LuauTidyTypeUtils, true};
 
     // Arena freezing marks the `TypeArena`'s underlying memory as read-only, raising an access violation whenever you mutate it.
     // This is useful for tracking down violations of Luau's memory model.
@@ -162,12 +199,21 @@ struct Fixture
     // This makes sure that errant cases of constraint solving failing to complete still pop up in tests.
     ScopedFastFlag sff_DebugLuauAlwaysShowConstraintSolvingIncomplete{FFlag::DebugLuauAlwaysShowConstraintSolvingIncomplete, true};
 
+    ScopedFastFlag sff_LuauBetterMetatableStringification{FFlag::LuauBetterMetatableStringification, true};
+    ScopedFastFlag sff_LuauBetterInferredGenericNames{FFlag::LuauBetterInferredGenericNames, true};
+    ScopedFastFlag sff_LuauSplitIceHandler{FFlag::LuauSplitIceHandler, true};
+
+    ScopedFastFlag sff_ParseExactTables{FFlag::DebugLuauParseExactTables, FFlag::DebugLuauForceExactTables};
+    ScopedFastFlag sff_ExactTableTypes{FFlag::DebugLuauExactTableTypes, FFlag::DebugLuauForceExactTables};
+
     TestFileResolver fileResolver;
     TestConfigResolver configResolver;
     NullModuleResolver moduleResolver;
     std::unique_ptr<SourceModule> sourceModule;
     InternalErrorReporter ice;
-
+    Allocator allocator;
+    AstNameTable nameTable{allocator};
+    TypeArena arena;
 
     std::string decorateWithTypes(const std::string& code);
 
@@ -194,6 +240,11 @@ struct Fixture
     // use this to test the stack guard itself.
     void limitStackSize(size_t size);
 
+    // Edits the result, pruning any warnings about missing annotations.  This
+    // is useful for tests that are specifically about how we infer unannotated
+    // symbols.
+    void ignoreMissingAnnotations(CheckResult& result);
+
 private:
     bool hasDumpedErrors = false;
 
@@ -201,9 +252,6 @@ protected:
     bool forAutocomplete = false;
     std::optional<Frontend> frontend;
     BuiltinTypes* builtinTypes = nullptr;
-
-    TypeArena simplifierArena;
-    SimplifierPtr simplifier{nullptr, nullptr};
 
     std::vector<ScopedFastInt> dynamicScopedInts;
 };
@@ -214,6 +262,11 @@ struct BuiltinsFixture : Fixture
 
     // For the purpose of our tests, we're always the latest version of type functions.
     Frontend& getFrontend() override;
+};
+
+struct IsSubtypeFixture : Fixture
+{
+    bool isSubtype(TypeId a, TypeId b);
 };
 
 std::optional<std::string> pathExprToModuleName(const ModuleName& currentModuleName, const std::vector<std::string_view>& segments);
@@ -247,16 +300,22 @@ std::optional<TypeId> linearSearchForBinding(Scope* scope, const char* name);
 void registerHiddenTypes(Frontend& frontend);
 void createSomeExternTypes(Frontend& frontend);
 
+enum class Relation;
+
+// Doctest stringification helpers.
+doctest::String toString(Relation rel);
+doctest::String toString(TableState state);
+
 template<typename E>
-const E* findError(const CheckResult& result)
+std::optional<TypeError> findError(const CheckResult& result)
 {
     for (const auto& e : result.errors)
     {
         if (auto p = get<E>(e))
-            return p;
+            return e;
     }
 
-    return nullptr;
+    return std::nullopt;
 }
 
 } // namespace Luau
@@ -378,3 +437,41 @@ const E* findError(const CheckResult& result)
             CHECK_MESSAGE(false, "Expected to find no " #Type " error"); \
         } \
     } while (false)
+
+#define CHECK_LONG_STRINGS_EQ(a, b) \
+    do \
+    { \
+        const auto aa = (a); \
+        const auto bb = (b); \
+        const auto aLines = split(aa, '\n'); \
+        const auto bLines = split(bb, '\n'); \
+        CHECK_MESSAGE(aLines.size() == bLines.size(), "Line counts don't match: " << aLines.size() << " != " << bLines.size()); \
+        bool anyWrong = false; \
+        for (size_t i = 0; i < std::min(aLines.size(), bLines.size()); ++i) \
+        { \
+            auto aLine = strip(aLines.at(i)); \
+            auto bLine = strip(bLines.at(i)); \
+            if (aLine != bLine) \
+                anyWrong = true; \
+            CHECK_MESSAGE(aLine == bLine, "Mismatch on line " << i << " between:\n\t«" << aLine << "»\nand\t«" << bLine << "»\n"); \
+        } \
+        if (anyWrong) \
+        { \
+            MESSAGE(aa); \
+            MESSAGE(bb); \
+        } \
+    } while (0)
+
+#define CHECK_ERROR_IS(err, ErrorClass) \
+    do \
+    { \
+        auto e = (err); \
+        CHECK_MESSAGE(get<ErrorClass>(e), "Expected " #ErrorClass " but got " << e); \
+    } while (0)
+
+#define REQUIRE_ERROR_IS(err, ErrorClass) \
+    do \
+    { \
+        auto e = (err); \
+        REQUIRE_MESSAGE(get<ErrorClass>(e), "Expected " #ErrorClass " but got " << e); \
+    } while (0)

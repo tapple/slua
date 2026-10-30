@@ -1,0 +1,72 @@
+-- Conformance test for ruleset serialization with flag descriptors.
+-- The C++ test harness registers serialize_particles(params), which returns
+-- the rules list for a subset of particle descriptors:
+--   flags      'i' tag 0  (backing field for flag bits)
+--   color_begin 'v' tag 1
+--   alpha_begin 'f' tag 2
+--   burst_rate  'f' tag 13
+-- Flag descriptors (all backed by tag 0):
+--   color_interp  0x001
+--   scale_interp  0x002
+--   bounce        0x004
+--   emissive      0x100
+
+local function check(params, expected_rules)
+    local got, want = lljson.slencode(serialize_particles(params)), lljson.slencode(expected_rules)
+    assert(got == want, `expected {want}, got {got}`)
+end
+
+-- nil params emits empty rules.
+check(nil, {})
+
+-- Params must be a table or nil.
+for _, bad in {5, "x", vector(1, 2, 3)} do
+    local ok, err = pcall(serialize_particles, bad)
+    assert(not ok and string.find(err, "table expected"), `expected a table error for {typeof(bad)}, got {err}`)
+end
+
+-- Scalar float and vector properties are serialized with their tags.
+check({ burst_rate = 2.5 }, {PSYS_SRC_BURST_RATE, 2.5})
+check(
+    { color_begin = vector(1, 0.5, 0.25) },
+    {PSYS_PART_START_COLOR, vector(1, 0.5, 0.25)}
+)
+
+-- Flag booleans merge into a single flags field entry.
+check({ color_interp = true }, {PSYS_PART_FLAGS, PSYS_PART_INTERP_COLOR_MASK})
+check(
+    { color_interp = true, bounce = true },
+    {PSYS_PART_FLAGS, bit32.bor(PSYS_PART_INTERP_COLOR_MASK, PSYS_PART_BOUNCE_MASK)}
+)
+
+-- Raw flags integer and boolean flag properties are merged together.
+check(
+    { flags = PSYS_PART_EMISSIVE_MASK, bounce = true },
+    {PSYS_PART_FLAGS, bit32.bor(PSYS_PART_EMISSIVE_MASK, PSYS_PART_BOUNCE_MASK)}
+)
+
+-- Multiple params serialize in ascending tag order (color_begin tag=1 before burst_rate tag=13).
+check(
+    { burst_rate = 1.0, color_begin = vector(1, 0, 0) },
+    {PSYS_PART_START_COLOR, vector(1, 0, 0), PSYS_SRC_BURST_RATE, 1.0}
+)
+
+-- A sole flag set to false still emits PSYS_PART_FLAGS = 0 (the clear path).
+check({ color_interp = false }, {PSYS_PART_FLAGS, 0})
+
+-- A false flag clears its own bit from the raw flags integer, leaving other bits intact.
+check(
+    { flags = bit32.bor(PSYS_PART_INTERP_COLOR_MASK, PSYS_PART_BOUNCE_MASK), color_interp = false },
+    {PSYS_PART_FLAGS, PSYS_PART_BOUNCE_MASK}
+)
+
+-- A float for an integer field is converted like the LSL integer cast, so an
+-- out-of-range value saturates instead of depending on the platform.
+check({ flags = 2.9 }, {PSYS_PART_FLAGS, 2})
+check({ flags = 1e300 }, {PSYS_PART_FLAGS, -2147483648})
+
+-- Flag properties only accept booleans and numbers.
+local ok, err = pcall(serialize_particles, { color_interp = "yes" })
+assert(not ok and string.find(err, "color_interp"), `expected a color_interp error, got {err}`)
+
+return "OK"

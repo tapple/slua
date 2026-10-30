@@ -3,6 +3,7 @@
 #include "Luau/LSLCompiler.h"
 
 #include "Luau/Compiler.h"
+#include "Luau/LSLBuiltins.h"
 #include "Luau/ParseResult.h"
 
 #include <tailslide/tailslide.hh>
@@ -16,6 +17,9 @@ constexpr uint32_t kMaxRegisterCount = 255;
 constexpr uint32_t kMaxLocalCount = 200;
 constexpr uint32_t kMaxStringImportRef = 1024;
 // static const uint32_t kMaxInstructionCount = 1'000'000'000;
+
+// Masks are 64 bits wide, so an event index past this can't be represented
+constexpr int kMaxEventIndex = 64;
 
 static Luau::Location convertLoc(TailslideLType *loc)
 {
@@ -52,11 +56,27 @@ bool LuauResourceVisitor::visit(LSLState *state)
     if (_mTopStateID >= INT16_MAX)
         throw Luau::CompileError(convertLoc(state->getLoc()), "Too many states");
     getSymbolData(state->getSymbol())->index = (int16_t)_mTopStateID++;
+    _mStateMasks.push_back(0);
     return true;
 }
 
 bool LuauResourceVisitor::visit(LSLEventHandler *handler) {
     handleFuncLike(handler);
+
+    // Parented to a node list which is parented to the state, same as the
+    // name mangling
+    auto *state_sym = handler->getParent()->getParent()->getSymbol();
+    LUAU_ASSERT(state_sym != nullptr);
+    // Tailslide numbered the event by its position in builtins.txt
+    const char *event_name = handler->getSymbol()->getName();
+    int event_index = handler->getSymbol()->getEventIndex();
+    if (event_index <= 0 || event_index > kMaxEventIndex)
+        throw Luau::CompileError(convertLoc(handler->getLoc()), Luau::format("Event '%s' has no usable index", event_name).c_str());
+    // The runtime dispatches by the same number, so the two had better agree
+    // on which builtins.txt they read
+    if (Luau::lslEventIndex(event_name) != event_index)
+        throw Luau::CompileError(convertLoc(handler->getLoc()), Luau::format("Event '%s' is numbered %d by the compiler but %d by the runtime", event_name, event_index, Luau::lslEventIndex(event_name)).c_str());
+    _mStateMasks[getSymbolData(state_sym)->index] |= (uint64_t)1 << (event_index - 1);
     return false;
 }
 
@@ -307,6 +327,27 @@ bool LuauLValueMutationVisitor::visit(Tailslide::LSLBinaryExpression* bin_expr)
 }
 
 
+class LuauSymbolUseVisitor : public ASTVisitor
+{
+public:
+    explicit LuauSymbolUseVisitor(LSLSymbol *sym): mSym(sym) {};
+    bool visit(Tailslide::LSLLValueExpression *lvalue) override;
+
+    LSLSymbol *mSym;
+    bool mSeen = false;
+};
+
+bool LuauSymbolUseVisitor::visit(Tailslide::LSLLValueExpression* lvalue)
+{
+    // Note that we don't care whether this was a read or a write, either one
+    // means the symbol's storage is still in use by the expression.
+    if (lvalue->getSymbol() == mSym)
+        mSeen = true;
+
+    return true;
+}
+
+
 // Copied from Compiler.cpp, used for keeping track of the virtual stack in registers
 struct RegScope
 {
@@ -372,14 +413,41 @@ static uint8_t srefHash(const Luau::BytecodeBuilder::StringRef string_ref)
     return (uint8_t)Luau::BytecodeBuilder::getStringHash(string_ref);
 }
 
-LuauVisitor::LuauVisitor(Luau::BytecodeBuilder* builder, LuauSymbolMap &symbol_map)
+LuauVisitor::LuauVisitor(Luau::BytecodeBuilder* builder, LuauSymbolMap &symbol_map, bool debug_lines)
     : _mSymbolMap(symbol_map)
     , mBuilder(builder)
     , mRegTop(0)
     , mStackSize(0)
     , mTargetReg(-1)
+    , mDebugLines(debug_lines)
 {
-    mBuilder->setDumpFlags(Luau::BytecodeBuilder::Dump_Code);
+}
+
+bool LuauVisitor::visitSpecific(LSLASTNode *node)
+{
+    if (!mDebugLines)
+        return ASTVisitor::visitSpecific(node);
+
+    // Nodes without a line of their own keep the enclosing node's
+    const int outer = mDebugLine;
+    if (const auto *loc = node->getLoc(); loc && loc->first_line > 0)
+        mDebugLine = loc->first_line;
+    mBuilder->setDebugLine(mDebugLine);
+    const bool result = ASTVisitor::visitSpecific(node);
+    mDebugLine = outer;
+    mBuilder->setDebugLine(mDebugLine);
+    return result;
+}
+
+// beginFunction() clears the builder's line, and a function whose
+// instructions aren't all on a line gets no line info at all
+void LuauVisitor::beginDebugFunction()
+{
+    if (!mDebugLines)
+        return;
+    const int line = mDebugLine > 0 ? mDebugLine : 1;
+    mBuilder->setDebugLine(line);
+    mBuilder->setDebugFunctionLineDefined(line);
 }
 
 bool LuauVisitor::visit(LSLScript* script)
@@ -396,6 +464,7 @@ bool LuauVisitor::visit(LSLScript* script)
 
     // Now we can build the implicit main function
     auto main_id = mBuilder->beginFunction(0);
+    beginDebugFunction();
     // Luau doesn't emit a name for the main function
     // mBuilder->setDebugFunctionName(sref("main"));
     // Walk over the globals
@@ -488,6 +557,7 @@ void LuauVisitor::buildFunction(LSLASTNode *func_like)
 
     auto *param_list = func_sym->getFunctionDecl();
     auto func_id = mBuilder->beginFunction(param_list->getNumChildren());
+    beginDebugFunction();
     // make sure the function id actually matches what we expect
     LUAU_ASSERT(func_id == sym_data.index);
 
@@ -628,6 +698,7 @@ bool LuauVisitor::visit(LSLForStatement *for_stmt)
     // execute instructions to initialize vars, there can be multiple
     for(auto *init_expr : *for_stmt->getInitExprs())
     {
+        [[maybe_unused]] RegScope expr_scope(this);
         init_expr->visit(this);
     }
     auto jump_to_start_label = mBuilder->emitLabel();
@@ -690,9 +761,15 @@ bool LuauVisitor::visit(LSLDoStatement * do_stmt)
         [[maybe_unused]] RegScope expr_scope(this);
         expr_reg = evalExprToSourceReg(do_stmt->getCheckExpr());
     }
-    // run the check expression, exiting the loop if it fails
+    // If the check expression is false, then jump over the back edge jumpback
+    // We don't need to patch this since the jump target is constant relative to this op.
+    // This is necessary so that we still get the checks we'd expect from a
+    // LOP_JUMPBACK.
+    mBuilder->emitAD(LOP_JUMPIFNOT, expr_reg, 1);
+
+    // Do the jump back to start
     auto jump_to_start = mBuilder->emitLabel();
-    mBuilder->emitAD(LOP_JUMPIF, expr_reg, 0);
+    mBuilder->emitAD(LOP_JUMPBACK, 0, 0);
     patchJumpOrThrow(jump_to_start, jump_to_start_label);
 
     return false;
@@ -710,7 +787,7 @@ bool LuauVisitor::visit(LSLJumpStatement *jump_stmt)
     // Whether we want to interrupt or not depends on whether this would result
     // in jumping backwards. If the label comes after the jump in the script,
     // it's a forward jump.
-    bool forward_jump = label_sym->getLabelDecl()->getLoc() > jump_stmt->getLoc();
+    bool forward_jump = *label_sym->getLabelDecl()->getLoc() > *jump_stmt->getLoc();
     _mJumpTargets[(uint32_t)mBuilder->emitLabel()] = label_sym;
     mBuilder->emitAD(forward_jump ? LOP_JUMP : LOP_JUMPBACK, 0, 0);
     return false;
@@ -1193,8 +1270,30 @@ bool LuauVisitor::visit(LSLBinaryExpression* bin_expr)
             else
             {
                 source_reg = _mSymbolMap[lval_sym].index;
-                TargetRegScope target_reg_scope(this, source_reg);
-                rhs->visit(this);
+
+                // A list expression emits its `NEWTABLE` into the target register before
+                // it evaluates its elements, so building straight into the destination
+                // would hand those elements an already-emptied list. Only lists do that,
+                // everything else writes its target after evaluating its operands.
+                bool self_referencing = false;
+                if (lval_sym->getIType() == LST_LIST)
+                {
+                    LuauSymbolUseVisitor use_visitor {lval_sym};
+                    rhs->visit(&use_visitor);
+                    self_referencing = use_visitor.mSeen;
+                }
+
+                if (self_referencing)
+                {
+                    // Build in a temporary and only store once the right-hand side has
+                    // been fully evaluated, the same order Mono uses.
+                    maybeMove((int16_t)source_reg, evalExprToSourceReg(rhs));
+                }
+                else
+                {
+                    TargetRegScope target_reg_scope(this, source_reg);
+                    rhs->visit(this);
+                }
             }
         }
 
@@ -1233,7 +1332,7 @@ bool LuauVisitor::visit(LSLBinaryExpression* bin_expr)
         if (lval_sym->getSubType() == SYM_GLOBAL)
         {
             source_reg = allocReg(bin_expr);
-            pushGlobal(source_reg, lval_sym->getName());
+            pushGlobal(source_reg, lval);
         }
         else
         {
@@ -1518,6 +1617,21 @@ bool LuauVisitor::visit(LSLBinaryExpression* bin_expr)
         if (swap_regs)
             std::swap(rhs_reg, lhs_reg);
 
+        // If target aliases with an operand, copy the operand to a temp
+        // before LOADK clobbers it.
+        if (target_reg == lhs_reg)
+        {
+            auto temp = allocReg(bin_expr);
+            mBuilder->emitABC(LOP_MOVE, temp, lhs_reg, 0);
+            lhs_reg = temp;
+        }
+        if (target_reg == rhs_reg)
+        {
+            auto temp = allocReg(bin_expr);
+            mBuilder->emitABC(LOP_MOVE, temp, rhs_reg, 0);
+            rhs_reg = temp;
+        }
+
         // Initialize target to true
         mBuilder->emitAD(LOP_LOADK, target_reg, addConstantInteger(1, INT16_MAX));
         // Jump over setting it to false if true
@@ -1779,7 +1893,7 @@ int16_t LuauVisitor::addConstant(LSLConstant* cv) const
         case LST_VECTOR:
         {
             auto *vv = dynamic_cast<LSLVectorConstant *>(cv)->getValue();
-            constant_id = mBuilder->addConstantVector(vv->x, vv->y, vv->z, 0.0);
+            constant_id = mBuilder->addConstantVectorf(vv->x, vv->y, vv->z, 0.0);
             break;
         }
         default:
@@ -2103,7 +2217,7 @@ void LuauVisitor::patchJumpOrThrow(size_t jumpLabel, size_t targetLabel)
 }
 
 
-void compileLSLOrThrow(Luau::BytecodeBuilder &bcb, const std::string &source)
+void compileLSLOrThrow(Luau::BytecodeBuilder &bcb, const std::string &source, LSLScriptInfo *info, bool debugLines)
 {
     thread_local bool builtins_initialized = false;
     if (!builtins_initialized) {
@@ -2193,16 +2307,19 @@ void compileLSLOrThrow(Luau::BytecodeBuilder &bcb, const std::string &source)
     LuauResourceVisitor luauResourceVisitor(&symbol_map);
     script->visit(&luauResourceVisitor);
 
-    LuauVisitor luauVisitor(&bcb, symbol_map);
+    LuauVisitor luauVisitor(&bcb, symbol_map, debugLines);
     script->visit(&luauVisitor);
+
+    if (info != nullptr)
+        info->stateHandlerMasks = luauResourceVisitor.getStateMasks();
 }
 
-std::string compileLSL(const std::string &source)
+std::string compileLSL(const std::string &source, LSLScriptInfo *info, bool debugLines)
 {
     Luau::BytecodeBuilder bcb;
     try
     {
-        compileLSLOrThrow(bcb, source);
+        compileLSLOrThrow(bcb, source, info, debugLines);
         return bcb.getBytecode();
     }
     catch (Luau::ParseErrors &e)
@@ -2220,6 +2337,23 @@ std::string compileLSL(const std::string &source)
     }
 }
 
+std::string compileLSLAssetOrThrow(const std::string &source, uint32_t apiVersion, bool debugLines)
+{
+    Luau::BytecodeBuilder bcb;
+    LSLScriptInfo info;
+    compileLSLOrThrow(bcb, source, &info, debugLines);
+
+    Luau::BytecodeHeader header;
+    header.isLSL = true;
+    header.apiVersion = apiVersion;
+    header.stateHandlerMasks = std::move(info.stateHandlerMasks);
+
+    std::string asset;
+    Luau::writeBytecodeHeader(asset, header);
+    asset += bcb.getBytecode();
+    return asset;
+}
+
 char* luau_lsl_compile(const char* source, size_t size, size_t* outsize, bool *is_error)
 {
     *outsize = 0;
@@ -2229,6 +2363,43 @@ char* luau_lsl_compile(const char* source, size_t size, size_t* outsize, bool *i
     {
         compileLSLOrThrow(bcb, std::string(source, size));
         result = bcb.getBytecode();
+        *is_error = false;
+    }
+    catch(Luau::ParseErrors &e)
+    {
+        std::string msg = ": Parse Errors:";
+        for (const Luau::ParseError &error : e.getErrors()) {
+            msg += Luau::format("\nLine %d: %s", error.getLocation().begin.line, error.what());
+        }
+
+        result = msg;
+        *is_error = true;
+    }
+    catch(Luau::CompileError &e)
+    {
+        // Users of this function expect only a single error message
+        std::string error = Luau::format(":%d: %s", e.getLocation().begin.line, e.what());
+
+        result = error;
+        *is_error = true;
+    }
+
+    char* copy = static_cast<char*>(malloc(result.size()));
+    if (!copy)
+        return nullptr;
+
+    memcpy(copy, result.data(), result.size());
+    *outsize = result.size();
+    return copy;
+}
+
+char* luau_lsl_compile_asset(const char* source, size_t size, uint32_t api_version, size_t* outsize, bool *is_error)
+{
+    *outsize = 0;
+    std::string result;
+    try
+    {
+        result = compileLSLAssetOrThrow(std::string(source, size), api_version);
         *is_error = false;
     }
     catch(Luau::ParseErrors &e)

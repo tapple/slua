@@ -37,12 +37,19 @@ mkdir -p "$stage/lib/release"
 
 pushd "$top"
     pushd "VM/include"
-    cp -v lua.h luaconf.h lualib.h llsl.h "$stage/include/luau/"
+    cp -v lua.h luaconf.h lualib.h llsl.h llruleset_builder.h "$stage/include/luau/"
     popd
     pushd "Compiler/include"
     cp -v luacode.h "$stage/include/luau/"
     popd
     cp -rv "Common/include/Luau" "$stage/include/luau/"
+    # The executor's public headers, and what they include from other libraries
+    cp -v "Executor/include/Luau/Executor.h" "Executor/include/Luau/Script.h" "$stage/include/luau/Luau/"
+    cp -v "Bytecode/include/Luau/BytecodeHeader.h" "$stage/include/luau/Luau/"
+    cp -v "LSLBuiltins/include/Luau/LSLBuiltins.h" "$stage/include/luau/Luau/"
+    # Tailslide's headers, laid out for `#include <tailslide/...>`
+    cp -rv "Tailslide/tailslide" "$stage/include/tailslide"
+    find "$stage/include/tailslide" -type f ! -name '*.hh' -delete
 
     # Don't litter the source directory with build artifacts
     mkdir -p "$stage/build"
@@ -66,7 +73,6 @@ pushd "$top"
                   -DCMAKE_INSTALL_PREFIX="$(cygpath -m "$stage")" \
                   -DCMAKE_C_FLAGS="$(remove_cxxstd $opts)" \
                   -DCMAKE_CXX_FLAGS="$opts" \
-                  -DLUAU_USE_TAILSLIDE=ON \
                   "$top"
             cmake --build . -- /p:Configuration=Release
             cmake --build . --target Luau.Repl.CLI -- /p:Configuration=Release
@@ -74,34 +80,47 @@ pushd "$top"
             mkdir -p "$stage/bin"
 
             cp -v "Release/Luau.Ast.lib" "$stage/lib/release/"
+            cp -v "Release/Luau.Bytecode.lib" "$stage/lib/release/"
             cp -v "Release/Luau.CodeGen.lib" "$stage/lib/release/"
             cp -v "Release/Luau.Compiler.lib" "$stage/lib/release/"
             cp -v "Release/Luau.Config.lib" "$stage/lib/release/"
             cp -v "Release/Luau.VM.lib" "$stage/lib/release/"
+            cp -v "Release/Luau.Executor.lib" "$stage/lib/release/"
+            cp -v "Release/Luau.LSLBuiltins.lib" "$stage/lib/release/"
             cp -v "Release/Luau.Common.lib" "$stage/lib/release/"
+            cp -v "Tailslide/Release/tailslide.lib" "$stage/lib/release/"
 
-            cp -v Release/luau.exe "$stage/bin/"
+            cp -v Release/slua.exe "$stage/bin/"
+            cp -v Release/slua-harness.exe "$stage/bin/"
         ;;
         darwin*|linux*)
-            # Continue compiling with asserts for now
-            LL_BUILD_RELEASE="$(remove_switch -DNDEBUG $LL_BUILD_RELEASE)"
+            # Optimized builds use the inherited release flags as-is, any local
+            # adjustments to them belong inside this guard
+            if [[ -z "${SLUA_OPTIMIZED_BUILD:-}" ]]; then
+                # Continue compiling with asserts for now
+                LL_BUILD_RELEASE="$(remove_switch -DNDEBUG $LL_BUILD_RELEASE)"
+            fi
             cmake -DCMAKE_INSTALL_PREFIX:STRING="${stage}" \
                   -DCMAKE_CXX_FLAGS="$LL_BUILD_RELEASE -m$AUTOBUILD_ADDRSIZE" \
                   -DCMAKE_C_FLAGS="$(remove_cxxstd $LL_BUILD_RELEASE) -m$AUTOBUILD_ADDRSIZE" \
-                  -DLUAU_USE_TAILSLIDE=ON \
                   "$top"
             cmake --build . -- -j8
 
             mkdir -p "$stage/bin"
 
             cp -v "libLuau.Ast.a" "$stage/lib/release"
+            cp -v "libLuau.Bytecode.a" "$stage/lib/release"
             cp -v "libLuau.CodeGen.a" "$stage/lib/release"
             cp -v "libLuau.Common.a" "$stage/lib/release"
             cp -v "libLuau.Compiler.a" "$stage/lib/release"
             cp -v "libLuau.Config.a" "$stage/lib/release"
             cp -v "libLuau.VM.a" "$stage/lib/release"
+            cp -v "libLuau.Executor.a" "$stage/lib/release"
+            cp -v "libLuau.LSLBuiltins.a" "$stage/lib/release"
+            cp -v "Tailslide/libtailslide.a" "$stage/lib/release"
 
-            cp -v "luau" "$stage/bin/"
+            cp -v "slua" "$stage/bin/"
+            cp -v "slua-harness" "$stage/bin/"
 
             # Run the conformance test for good measure
             "${stage}/build/Luau.Conformance"
@@ -111,3 +130,4 @@ popd
 
 mkdir -p "$stage/LICENSES"
 cp "$top/LICENSE.txt" "$stage/LICENSES/luau.txt"
+cp "$top/Tailslide/LICENSE" "$stage/LICENSES/tailslide.txt"

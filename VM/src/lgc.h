@@ -59,6 +59,12 @@
 #define FIXEDBIT 3
 #define WHITEBITS bit2mask(WHITE0BIT, WHITE1BIT)
 
+// ServerLua: transient mark used only by the user reachability walk
+//  (luaC_enumreachableuserallocs). Set during a walk and cleared before it
+//  returns, actual GC should never see this.
+//  Thank you Luau team for leaving some bits free :)
+#define WALKBIT 7
+
 #define iswhite(x) test2bits((x)->gch.marked, WHITE0BIT, WHITE1BIT)
 #define isblack(x) testbit((x)->gch.marked, BLACKBIT)
 #define isgray(x) (!testbits((x)->gch.marked, WHITEBITS | bitmask(BLACKBIT)))
@@ -78,7 +84,7 @@
 
 #define luaC_checkGC(L) \
     { \
-        condhardstacktests(luaD_reallocstack(L, L->stacksize - EXTRA_STACK, 0)); \
+        condhardstacktests(luaD_reallocstack(L, L->stacksize - EXTRA_STACK, 0), 1); \
         if (luaC_needsGC(L)) \
         { \
             condhardmemtests(luaC_validate(L), 1); \
@@ -120,6 +126,12 @@
             luaC_barrierback(L, obj2gco(L), &L->gclist); \
     }
 
+#define luaC_objectbarrier(L) \
+    { \
+        if (isblack(obj2gco(L))) \
+            luaC_barrierback(L, obj2gco(L), &L->gclist); \
+    }
+
 #define luaC_init(L, o, tt_) \
     { \
         o->marked = luaC_white(L->global); \
@@ -130,12 +142,12 @@
 LUAI_FUNC void luaC_freeall(lua_State* L);
 LUAI_FUNC size_t luaC_step(lua_State* L, bool assist);
 LUAI_FUNC void luaC_fullgc(lua_State* L);
-LUAI_FUNC void luaC_initobj(lua_State* L, GCObject* o, uint8_t tt);
 LUAI_FUNC void luaC_upvalclosed(lua_State* L, UpVal* uv);
 LUAI_FUNC void luaC_barrierf(lua_State* L, GCObject* o, GCObject* v);
 LUAI_FUNC void luaC_barriertable(lua_State* L, LuaTable* t, GCObject* v);
 LUAI_FUNC void luaC_barrierback(lua_State* L, GCObject* o, GCObject** gclist);
 LUAI_FUNC void luaC_validate(lua_State* L);
+LUAI_FUNC void luaC_fixall(lua_State* L);
 LUAI_FUNC void luaC_dump(lua_State* L, void* file, const char* (*categoryName)(lua_State* L, uint8_t memcat));
 LUAI_FUNC void luaC_enumheap(
     lua_State* L,
@@ -151,5 +163,8 @@ LUAI_FUNC void luaC_enumreachableuserallocs(
     const lua_OpaqueGCObjectSet* free_objects
 );
 LUAI_FUNC lua_OpaqueGCObjectSet luaC_collectfreeobjects(lua_State* L);
+LUAI_FUNC size_t luaC_calclogicalgcosize(GCObject* obj);
+LUAI_FUNC const char* luaC_gettablemode(global_State* g, LuaTable* h);
+
 LUAI_FUNC int64_t luaC_allocationrate(lua_State* L);
 LUAI_FUNC const char* luaC_statename(int state);

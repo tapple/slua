@@ -3,10 +3,11 @@
 
 #include "Luau/Ast.h"
 #include "Luau/Constraint.h"
+#include "Luau/ConstraintGraph.h"
 #include "Luau/ConstraintSet.h"
 #include "Luau/ControlFlow.h"
+#include "Luau/ControlFlowGraph.h"
 #include "Luau/DataFlowGraph.h"
-#include "Luau/EqSatSimplification.h"
 #include "Luau/HashUtil.h"
 #include "Luau/InsertionOrderedMap.h"
 #include "Luau/Module.h"
@@ -14,9 +15,11 @@
 #include "Luau/NotNull.h"
 #include "Luau/Polarity.h"
 #include "Luau/Refinement.h"
+#include "Luau/DenseHash.h"
 #include "Luau/Symbol.h"
 #include "Luau/TypeFwd.h"
 #include "Luau/TypeIds.h"
+#include "Luau/TypeStateMap.h"
 #include "Luau/TypeUtils.h"
 
 #include <memory>
@@ -59,6 +62,31 @@ struct InferencePack
     }
 };
 
+struct Checkpoint
+{
+    size_t offset = 0;
+};
+
+struct ClassDeclRecord
+{
+    ClassDeclRecord(TypeId classTy, TypeId instanceTy, DenseHashMap<AstName, TypeId> memberTypes)
+        : classTy(classTy)
+        , instanceTy(instanceTy)
+        , memberTypes(std::move(memberTypes))
+    {
+        LUAU_ASSERT(classTy);
+        LUAU_ASSERT(instanceTy);
+    }
+
+    // The type of the class object itself.
+    TypeId classTy;
+
+    // The type of an instance of the class.
+    TypeId instanceTy;
+
+    DenseHashMap<AstName, TypeId> memberTypes;
+};
+
 struct ConstraintGenerator
 {
     // A list of all the scopes in the module. This vector holds ownership of the
@@ -67,6 +95,7 @@ struct ConstraintGenerator
     std::vector<std::pair<Location, ScopePtr>> scopes;
 
     ModulePtr module;
+    std::shared_ptr<ModuleName> sharedModuleName;
     NotNull<BuiltinTypes> builtinTypes;
     const NotNull<TypeArena> arena;
     // The root scope of the module we're generating constraints for.
@@ -88,8 +117,9 @@ struct ConstraintGenerator
     // might have.
     //
     // See the functions recordInferredBinding and fillInInferredBindings.
-    DenseHashMap<Symbol, InferredBinding> inferredBindings{{}};
+    DenseHashMap<Symbol, InferredBinding> inferredBindings;
 
+    // Remove constraints, freeTypes, and scopeToFunction with LuauCyclicRequireTypeInference: these move to ConstraintGraph (cgraph).
     // Constraints that go straight to the solver.
     std::vector<ConstraintPtr> constraints;
 
@@ -97,10 +127,10 @@ struct ConstraintGenerator
     TypeIds freeTypes;
 
     // Map a function's signature scope back to its signature type.
-    DenseHashMap<Scope*, TypeId> scopeToFunction{nullptr};
+    DenseHashMap<Scope*, TypeId> scopeToFunction;
 
     // The private scope of type aliases for which the type parameters belong to.
-    DenseHashMap<const AstStatTypeAlias*, ScopePtr> astTypeAliasDefiningScopes{nullptr};
+    DenseHashMap<const AstStatTypeAlias*, ScopePtr> astTypeAliasDefiningScopes;
 
     NotNull<const DataFlowGraph> dfg;
     RefinementArena refinementArena;
@@ -113,11 +143,9 @@ struct ConstraintGenerator
     // Needed to be able to enable error-suppression preservation for immediate refinements.
     NotNull<Normalizer> normalizer;
 
-    NotNull<Simplifier> simplifier;
-
     // Needed to register all available type functions for execution at later stages.
     NotNull<TypeFunctionRuntime> typeFunctionRuntime;
-    DenseHashMap<const AstStatTypeFunction*, ScopePtr> astTypeFunctionEnvironmentScopes{nullptr};
+    DenseHashMap<const AstStatTypeFunction*, ScopePtr> astTypeFunctionEnvironmentScopes;
 
     // Needed to resolve modules to make 'require' import types properly.
     NotNull<ModuleResolver> moduleResolver;
@@ -130,18 +158,25 @@ struct ConstraintGenerator
     std::function<void(const ModuleName&, const ScopePtr&)> prepareModuleScope;
     std::vector<RequireCycle> requireCycles;
 
-    DenseHashMap<TypeId, TypeIds> localTypes{nullptr};
+    DenseHashMap<TypeId, TypeIds> localTypes;
 
-    DenseHashMap<AstExpr*, Inference> inferredExprCache{nullptr};
+    DenseHashMap<AstExpr*, Inference> inferredExprCache;
+
+    DenseHashMap<AstLocal*, std::unique_ptr<ClassDeclRecord>> classDeclRecords;
 
     DcrLogger* logger;
 
     bool recursionLimitMet = false;
 
+    NotNull<ConstraintGraph> cgraph;
+
+    // Defer module-level generalization constraints to the solver so that we can generalize them after all other constraints have been solved.
+    ConstraintPtr moduleGeneralizationConstraint;
+
+    CFG::TypeStateMap* typestate = nullptr;
     ConstraintGenerator(
         ModulePtr module,
         NotNull<Normalizer> normalizer,
-        NotNull<Simplifier> simplifier,
         NotNull<TypeFunctionRuntime> typeFunctionRuntime,
         NotNull<ModuleResolver> moduleResolver,
         NotNull<BuiltinTypes> builtinTypes,
@@ -151,7 +186,9 @@ struct ConstraintGenerator
         std::function<void(const ModuleName&, const ScopePtr&)> prepareModuleScope,
         DcrLogger* logger,
         NotNull<DataFlowGraph> dfg,
-        std::vector<RequireCycle> requireCycles
+        std::vector<RequireCycle> requireCycles,
+        NotNull<ConstraintGraph> cgraph,
+        CFG::TypeStateMap* typestate = nullptr
     );
 
     ConstraintSet run(AstStatBlock* block);
@@ -177,7 +214,11 @@ private:
 
     std::vector<TypeId> unionsToSimplify;
 
-    DenseHashMap<std::pair<TypeId, std::string>, TypeId, PairHash<TypeId, std::string>> propIndexPairsSeen{{nullptr, ""}};
+    DenseHashSet<AstName> uninitializedGlobals;
+
+    Polarity polarity = Polarity::None;
+
+    DenseHashMap<std::pair<TypeId, std::string>, TypeId, PairHash<TypeId, std::string>> propIndexPairsSeen;
 
     // Used to keep track of when we are inside a large table and should
     // opt *not* to do type inference for singletons.
@@ -222,6 +263,9 @@ private:
      * @param cv the constraint variant to add.
      * @return the pointer to the inserted constraint
      */
+    TypeId resolveRHSType(const ScopePtr& scope, Location location, AstExpr* expr);
+    TypeId resolveLHSType(const ScopePtr& scope, Location location, const CFG::LValue& lv);
+
     NotNull<Constraint> addConstraint(const ScopePtr& scope, const Location& location, ConstraintV cv);
 
     /**
@@ -261,7 +305,8 @@ private:
     );
     void applyRefinements(const ScopePtr& scope, Location location, RefinementId refinement);
 
-    LUAU_NOINLINE void checkAliases(const ScopePtr& scope, AstStatBlock* block);
+    LUAU_NOINLINE void prototypeTypeDefinitions(const ScopePtr& scope, AstStatBlock* block);
+    void prototypeClass(const ScopePtr& scope, AstStatClass* classDecl, TypeId classObjectTy);
 
     ControlFlow visitBlockWithoutChildScope(const ScopePtr& scope, AstStatBlock* block);
 
@@ -281,11 +326,21 @@ private:
     ControlFlow visit(const ScopePtr& scope, AstStatTypeAlias* alias);
     ControlFlow visit(const ScopePtr& scope, AstStatTypeFunction* function);
     ControlFlow visit(const ScopePtr& scope, AstStatDeclareGlobal* declareGlobal);
-    ControlFlow visit(const ScopePtr& scope, AstStatDeclareExternType* declareExternType);
-    ControlFlow visit(const ScopePtr& scope, AstStatDeclareFunction* declareFunction);
+    ControlFlow visit(const ScopePtr& scope, AstStatDeclareExternType* declaredExternType);
+    ControlFlow visit(const ScopePtr& scope, AstStatDeclareFunction* global);
+    ControlFlow visit(const ScopePtr& scope, AstStatClass* statClass);
     ControlFlow visit(const ScopePtr& scope, AstStatError* error);
 
-    InferencePack checkPack(const ScopePtr& scope, AstArray<AstExpr*> exprs, const std::vector<std::optional<TypeId>>& expectedTypes = {});
+
+    InferencePack checkPack(
+        const ScopePtr& scope,
+        AstArray<AstExpr*> exprs,
+        const std::vector<std::optional<TypeId>>& expectedTypes,
+        bool generalize
+    );
+
+    InferencePack checkPack_DEPRECATED(const ScopePtr& scope, AstArray<AstExpr*> exprs, const std::vector<std::optional<TypeId>>& expectedTypes = {});
+
     InferencePack checkPack(
         const ScopePtr& scope,
         AstExpr* expr,
@@ -293,7 +348,15 @@ private:
         bool generalize = true
     );
 
-    InferencePack checkPack(const ScopePtr& scope, AstExprCall* call);
+    InferencePack checkPack(const ScopePtr& scope, AstExprCall* call, std::optional<TypeId> expectedType = std::nullopt);
+    InferencePack checkExprCall(
+        const ScopePtr& scope,
+        AstExprCall* call,
+        TypeId fnType,
+        Checkpoint funcBeginCheckpoint,
+        Checkpoint funcEndCheckpoint,
+        std::optional<TypeId> expectedType
+    );
 
     /**
      * Checks an expression that is expected to evaluate to one type.
@@ -334,7 +397,11 @@ private:
     Inference check(const ScopePtr& scope, AstExprTypeAssertion* typeAssert);
     Inference check(const ScopePtr& scope, AstExprInterpString* interpString);
     Inference check(const ScopePtr& scope, AstExprInstantiate* explicitTypeInstantiation);
-    Inference check(const ScopePtr& scope, AstExprTable* expr, std::optional<TypeId> expectedType);
+
+    Inference check_DEPRECATED(const ScopePtr& scope, AstExprTable* expr, std::optional<TypeId> expectedType);
+
+    Inference check(const ScopePtr& scope, AstExprTable* expr, std::optional<TypeId> expectedType, bool generalize);
+
     std::tuple<TypeId, TypeId, RefinementId> checkBinary(
         const ScopePtr& scope,
         AstExprBinary::Op op,
@@ -346,7 +413,7 @@ private:
     void visitLValue(const ScopePtr& scope, AstExpr* expr, TypeId rhsType);
     void visitLValue(const ScopePtr& scope, AstExprLocal* local, TypeId rhsType);
     void visitLValue(const ScopePtr& scope, AstExprGlobal* global, TypeId rhsType);
-    void visitLValue(const ScopePtr& scope, AstExprIndexName* indexName, TypeId rhsType);
+    void visitLValue(const ScopePtr& scope, AstExprIndexName* expr, TypeId rhsType);
     void visitLValue(const ScopePtr& scope, AstExprIndexExpr* indexExpr, TypeId rhsType);
 
     struct FunctionSignature
@@ -364,6 +431,7 @@ private:
 
     FunctionSignature checkFunctionSignature(
         const ScopePtr& parent,
+        ClassDeclRecord* enclosingClass,
         AstExprFunction* fn,
         std::optional<TypeId> expectedType = {},
         std::optional<Location> originalName = {}
@@ -381,6 +449,7 @@ private:
     TypeId resolveTableType(const ScopePtr& scope, AstType* ty, AstTypeTable* tab, bool inTypeArguments, bool replaceErrorWithFresh);
     TypeId resolveFunctionType(const ScopePtr& scope, AstType* ty, AstTypeFunction* fn, bool inTypeArguments, bool replaceErrorWithFresh);
 
+public:
     /**
      * Resolves a type from its AST annotation.
      * @param scope the scope that the type annotation appears within.
@@ -388,8 +457,15 @@ private:
      * @param inTypeArguments whether we are resolving a type that's contained within type arguments, `<...>`.
      * @return the type of the AST annotation.
      **/
-    TypeId resolveType(const ScopePtr& scope, AstType* ty, bool inTypeArguments, bool replaceErrorWithFresh = false);
+    TypeId resolveType(
+        const ScopePtr& scope,
+        AstType* ty,
+        bool inTypeArguments,
+        bool replaceErrorWithFresh = false,
+        Polarity initialPolarity = Polarity::Positive
+    );
 
+private:
     // resolveType() is recursive, but we only want to invoke
     // inferGenericPolarities() once at the very end.  We thus isolate the
     // recursive part of the algorithm to this internal helper.
@@ -402,9 +478,15 @@ private:
      * @param inTypeArguments whether we are resolving a type that's contained within type arguments, `<...>`.
      * @return the type pack of the AST annotation.
      **/
-    TypePackId resolveTypePack(const ScopePtr& scope, AstTypePack* tp, bool inTypeArguments, bool replaceErrorWithFresh = false);
+    TypePackId resolveTypePack(
+        const ScopePtr& scope,
+        AstTypePack* tp,
+        bool inTypeArguments,
+        bool replaceErrorWithFresh = false,
+        Polarity initialPolarity = Polarity::Positive
+    );
 
-    // Inner hepler for resolveTypePack
+    // Inner helper for resolveTypePack
     TypePackId resolveTypePack_(const ScopePtr& scope, AstTypePack* tp, bool inTypeArguments, bool replaceErrorWithFresh = false);
 
     /**
@@ -414,7 +496,15 @@ private:
      * @param inTypeArguments whether we are resolving a type that's contained within type arguments, `<...>`.
      * @return the type pack of the AST annotation.
      **/
-    TypePackId resolveTypePack(const ScopePtr& scope, const AstTypeList& list, bool inTypeArguments, bool replaceErrorWithFresh = false);
+    TypePackId resolveTypePack(
+        const ScopePtr& scope,
+        const AstTypeList& list,
+        bool inTypeArguments,
+        bool replaceErrorWithFresh = false,
+        Polarity initialPolarity = Polarity::Positive
+    );
+
+    TypePackId resolveTypePack_(const ScopePtr& scope, const AstTypeList& list, bool inTypeArguments, bool replaceErrorWithFresh);
 
     /**
      * Creates generic types given a list of AST definitions, resolving default

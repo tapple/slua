@@ -19,7 +19,8 @@
 // used to control the recursion limit of any operations done by user-defined type functions
 // currently, controls serialization, deserialization, and `type.copy`
 LUAU_DYNAMIC_FASTINTVARIABLE(LuauTypeFunctionSerdeIterationLimit, 100'000);
-LUAU_FASTFLAG(LuauEmplaceNotPushBack)
+
+LUAU_FASTFLAG(LuauTypeFunctionSerializeArgNames)
 
 namespace Luau
 {
@@ -62,7 +63,7 @@ public:
         shallowSerialize(ty);
         run();
 
-        if (hasExceededIterationLimit() || state->errors.size() != 0)
+        if (hasExceededIterationLimit() || hasErrors())
             return nullptr;
 
         return find(ty).value_or(nullptr);
@@ -73,13 +74,18 @@ public:
         shallowSerialize(tp);
         run();
 
-        if (hasExceededIterationLimit() || state->errors.size() != 0)
+        if (hasExceededIterationLimit() || hasErrors())
             return nullptr;
 
         return find(tp).value_or(nullptr);
     }
 
 private:
+    bool hasErrors() const
+    {
+        return !state->errors.empty();
+    }
+
     bool hasExceededIterationLimit() const
     {
         if (DFInt::LuauTypeFunctionSerdeIterationLimit == 0)
@@ -94,7 +100,7 @@ private:
         {
             ++steps;
 
-            if (hasExceededIterationLimit() || state->errors.size() != 0)
+            if (hasExceededIterationLimit() || hasErrors())
                 break;
 
             auto [ty, tfti] = queue.back();
@@ -155,6 +161,9 @@ private:
             case PrimitiveType::Number:
                 target = typeFunctionRuntime->typeArena.allocate(TypeFunctionPrimitiveType(TypeFunctionPrimitiveType::Number));
                 break;
+            case PrimitiveType::Integer:
+                target = typeFunctionRuntime->typeArena.allocate(TypeFunctionPrimitiveType(TypeFunctionPrimitiveType::Integer));
+                break;
             case PrimitiveType::String:
                 target = typeFunctionRuntime->typeArena.allocate(TypeFunctionPrimitiveType(TypeFunctionPrimitiveType::String));
                 break;
@@ -167,10 +176,7 @@ private:
             case PrimitiveType::Function:
             case PrimitiveType::Table:
             default:
-            {
-                std::string error = format("Argument of primitive type %s is not currently serializable by type functions", toString(ty).c_str());
-                state->errors.push_back(error);
-            }
+                state->errors.emplace_back(Location{}, UnsupportedType{ty});
             }
         }
         else if (get<UnknownType>(ty))
@@ -187,8 +193,7 @@ private:
                 target = typeFunctionRuntime->typeArena.allocate(TypeFunctionSingletonType{TypeFunctionStringSingleton{ss->value}});
             else
             {
-                std::string error = format("Argument of singleton type %s is not currently serializable by type functions", toString(ty).c_str());
-                state->errors.push_back(error);
+                state->errors.emplace_back(Location{}, UnsupportedType{ty});
             }
         }
         else if (get<UnionType>(ty))
@@ -223,8 +228,7 @@ private:
         }
         else
         {
-            std::string error = format("Argument of type %s is not currently serializable by type functions", toString(ty).c_str());
-            state->errors.push_back(error);
+            state->errors.emplace_back(Location{}, UnsupportedType{ty});
         }
 
         types[ty] = target;
@@ -256,8 +260,7 @@ private:
         }
         else
         {
-            std::string error = format("Argument of type pack %s is not currently serializable by type functions", toString(tp).c_str());
-            state->errors.push_back(error);
+            state->errors.emplace_back(Location{}, UnsupportedTypePack{tp});
         }
 
         packs[tp] = target;
@@ -294,9 +297,9 @@ private:
         else if (auto [g1, g2] = std::tuple{get<GenericType>(ty), getMutable<TypeFunctionGenericType>(tfti)}; g1 && g2)
             serializeChildren(g1, g2);
         else
-        { // Either this or ty and tfti do not represent the same type
-            std::string error = format("Argument of type %s is not currently serializable by type functions", toString(ty).c_str());
-            state->errors.push_back(error);
+        {
+            // Either this or ty and tfti do not represent the same type
+            state->errors.emplace_back(Location{}, UnsupportedType{ty});
         }
     }
 
@@ -309,9 +312,9 @@ private:
         else if (auto [gPack1, gPack2] = std::tuple{get<GenericTypePack>(tp), getMutable<TypeFunctionGenericTypePack>(tftp)}; gPack1 && gPack2)
             serializeChildren(gPack1, gPack2);
         else
-        { // Either this or ty and tfti do not represent the same type
-            std::string error = format("Argument of type pack %s is not currently serializable by type functions", toString(tp).c_str());
-            state->errors.push_back(error);
+        {
+            // Either this or tp and tftp do not represent the same type
+            state->errors.emplace_back(Location{}, UnsupportedTypePack{tp});
         }
     }
 
@@ -383,7 +386,11 @@ private:
         }
 
         if (t1->indexer)
-            t2->indexer = TypeFunctionTableIndexer(shallowSerialize(t1->indexer->indexType), shallowSerialize(t1->indexer->indexResultType));
+        {
+            t2->indexer = TypeFunctionTableIndexer(
+                shallowSerialize(t1->indexer->indexType), shallowSerialize(t1->indexer->indexResultType), t1->indexer->isReadOnly
+            );
+        }
     }
 
     void serializeChildren(const MetatableType* m1, TypeFunctionTableType* m2)
@@ -407,6 +414,18 @@ private:
 
         f2->argTypes = shallowSerialize(f1->argTypes);
         f2->retTypes = shallowSerialize(f1->retTypes);
+
+        if (FFlag::LuauTypeFunctionSerializeArgNames)
+        {
+            f2->argNames.reserve(f1->argNames.size());
+            for (const auto& argName : f1->argNames)
+            {
+                if (argName)
+                    f2->argNames.emplace_back(argName->name);
+                else
+                    f2->argNames.emplace_back();
+            }
+        }
     }
 
     void serializeChildren(const ExternType* c1, TypeFunctionExternType* c2)
@@ -549,7 +568,7 @@ public:
         shallowDeserialize(ty);
         run();
 
-        if (hasExceededIterationLimit() || state->errors.size() != 0)
+        if (hasExceededIterationLimit() || hasErrors())
         {
             TypeId error = state->ctx->builtins->errorType;
             types[ty] = error;
@@ -564,7 +583,7 @@ public:
         shallowDeserialize(tp);
         run();
 
-        if (hasExceededIterationLimit() || state->errors.size() != 0)
+        if (hasExceededIterationLimit() || hasErrors())
         {
             TypePackId error = state->ctx->builtins->errorTypePack;
             packs[tp] = error;
@@ -583,13 +602,23 @@ private:
         return steps + queue.size() >= size_t(DFInt::LuauTypeFunctionSerdeIterationLimit);
     }
 
+    bool hasErrors() const
+    {
+        return !state->errors.empty();
+    }
+
+    void pushRuntimeError(std::string message)
+    {
+        state->errors.emplace_back(Location{}, RuntimeError{std::move(message)});
+    }
+
     void run()
     {
         while (!queue.empty())
         {
             ++steps;
 
-            if (hasExceededIterationLimit() || state->errors.size() != 0)
+            if (hasExceededIterationLimit() || hasErrors())
                 break;
 
             auto [tfti, ty] = queue.back();
@@ -598,7 +627,7 @@ private:
             deserializeChildren(tfti, ty);
 
             // If we have completed working on all children of a function, remove the generic parameters from scope
-            if (!functionScopes.empty() && queue.size() == functionScopes.back().oldQueueSize && state->errors.empty())
+            if (!functionScopes.empty() && queue.size() == functionScopes.back().oldQueueSize && !hasErrors())
             {
                 closeFunctionScope(functionScopes.back().function);
                 functionScopes.pop_back();
@@ -670,6 +699,9 @@ private:
             case TypeFunctionPrimitiveType::Type::Number:
                 target = state->ctx->builtins->numberType;
                 break;
+            case TypeFunctionPrimitiveType::Type::Integer:
+                target = state->ctx->builtins->integerType;
+                break;
             case TypeFunctionPrimitiveType::Type::String:
                 target = state->ctx->builtins->stringType;
                 break;
@@ -724,7 +756,7 @@ private:
         {
             if (g->isPack)
             {
-                state->errors.push_back(format("Generic type pack '%s...' cannot be placed in a type position", g->name.c_str()));
+                pushRuntimeError(format("Generic type pack '%s...' cannot be placed in a type position", g->name.c_str()));
                 return nullptr;
             }
             else
@@ -740,7 +772,7 @@ private:
 
                 if (it == genericTypes.rend())
                 {
-                    state->errors.push_back(format("Generic type '%s' is not in a scope of the active generic function", g->name.c_str()));
+                    pushRuntimeError(format("Generic type '%s' is not in a scope of the active generic function", g->name.c_str()));
                     return nullptr;
                 }
 
@@ -783,7 +815,7 @@ private:
 
             if (it == genericPacks.rend())
             {
-                state->errors.push_back(format("Generic type pack '%s...' is not in a scope of the active generic function", gPack->name.c_str()));
+                pushRuntimeError(format("Generic type pack '%s...' is not in a scope of the active generic function", gPack->name.c_str()));
                 return nullptr;
             }
 
@@ -911,7 +943,7 @@ private:
         }
 
         if (t2->indexer.has_value())
-            t1->indexer = TableIndexer(shallowDeserialize(t2->indexer->keyType), shallowDeserialize(t2->indexer->valueType));
+            t1->indexer = TableIndexer(shallowDeserialize(t2->indexer->keyType), shallowDeserialize(t2->indexer->valueType), t2->indexer->isReadOnly);
     }
 
     void deserializeChildren(TypeFunctionTableType* m2, MetatableType* m1)
@@ -925,48 +957,53 @@ private:
 
     void deserializeChildren(TypeFunctionFunctionType* f2, FunctionType* f1)
     {
-        if (FFlag::LuauEmplaceNotPushBack)
-            functionScopes.emplace_back(queue.size(), f2);
-        else
-            functionScopes.push_back({queue.size(), f2});
-
+        functionScopes.emplace_back(queue.size(), f2);
         std::set<std::pair<bool, std::string>> genericNames;
 
         // Introduce generic function parameters into scope
         for (auto ty : f2->generics)
         {
             auto gty = get<TypeFunctionGenericType>(ty);
-            LUAU_ASSERT(gty && !gty->isPack);
+            if (!gty || gty->isPack)
+            {
+                pushRuntimeError("Encountered unexpected generic");
+                return;
+            }
+            else
+                LUAU_ASSERT(gty && !gty->isPack);
 
             std::pair<bool, std::string> nameKey = std::make_pair(gty->isNamed, gty->name);
 
             // Duplicates are not allowed
             if (genericNames.find(nameKey) != genericNames.end())
             {
-                state->errors.push_back(format("Duplicate type parameter '%s'", gty->name.c_str()));
+                pushRuntimeError(format("Duplicate type parameter '%s'", gty->name.c_str()));
                 return;
             }
 
             genericNames.insert(nameKey);
 
             TypeId mapping = state->ctx->arena->addTV(Type(gty->isNamed ? GenericType{state->ctx->scope.get(), gty->name} : GenericType{}));
-            if (FFlag::LuauEmplaceNotPushBack)
-                genericTypes.emplace_back(gty->isNamed, gty->name, mapping);
-            else
-                genericTypes.push_back({gty->isNamed, gty->name, mapping});
+            genericTypes.emplace_back(gty->isNamed, gty->name, mapping);
         }
 
         for (auto tp : f2->genericPacks)
         {
             auto gtp = get<TypeFunctionGenericTypePack>(tp);
-            LUAU_ASSERT(gtp);
+            if (!gtp)
+            {
+                pushRuntimeError("Encountered unexpected generic type pack");
+                return;
+            }
+            else
+                LUAU_ASSERT(gtp);
 
             std::pair<bool, std::string> nameKey = std::make_pair(gtp->isNamed, gtp->name);
 
             // Duplicates are not allowed
             if (genericNames.find(nameKey) != genericNames.end())
             {
-                state->errors.push_back(format("Duplicate type parameter '%s'", gtp->name.c_str()));
+                pushRuntimeError(format("Duplicate type parameter '%s'", gtp->name.c_str()));
                 return;
             }
 
@@ -974,10 +1011,7 @@ private:
 
             TypePackId mapping =
                 state->ctx->arena->addTypePack(TypePackVar(gtp->isNamed ? GenericTypePack{state->ctx->scope.get(), gtp->name} : GenericTypePack{}));
-            if (FFlag::LuauEmplaceNotPushBack)
-                genericPacks.emplace_back(gtp->isNamed, gtp->name, mapping);
-            else
-                genericPacks.push_back({gtp->isNamed, gtp->name, mapping});
+            genericPacks.emplace_back(gtp->isNamed, gtp->name, mapping);
         }
 
         f1->generics.reserve(f2->generics.size());
@@ -993,6 +1027,18 @@ private:
 
         if (f2->retTypes)
             f1->retTypes = shallowDeserialize(f2->retTypes);
+
+        if (FFlag::LuauTypeFunctionSerializeArgNames)
+        {
+            f1->argNames.reserve(f2->argNames.size());
+            for (const auto& name : f2->argNames)
+            {
+                if (name)
+                    f1->argNames.emplace_back(FunctionArgument{*name, {}});
+                else
+                    f1->argNames.emplace_back();
+            }
+        }
     }
 
     void deserializeChildren(TypeFunctionExternType* c2, ExternType* c1)

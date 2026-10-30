@@ -3,8 +3,10 @@
 #pragma once
 
 // When debugging complex issues, consider enabling one of these:
-// This will reallocate the stack very aggressively at every opportunity; use this with asan to catch stale stack pointers
+// This will reallocate the stack very aggressively at most opportunities; use this with asan to catch stale stack pointers
 // #define HARDSTACKTESTS 1
+// This will reallocate the stack very aggressively at every opportunity, including whenever a metamethod could have been invoked
+// #define HARDSTACKTESTS 2
 // This will call GC validation very aggressively at every incremental GC step; use this with caution as it's SLOW
 // #define HARDMEMTESTS 1
 // This will call GC validation very aggressively at every GC opportunity; use this with caution as it's VERY SLOW
@@ -71,7 +73,7 @@
 #define LUA_IDSIZE 256
 #endif
 
-// LUA_MINSTACK is the guaranteed number of Lua stack slots available to a C function
+// LUA_MINSTACK is the initial number of reserved stack slots for a C function
 #ifndef LUA_MINSTACK
 #define LUA_MINSTACK 20
 #endif
@@ -116,6 +118,11 @@
 #define LUA_MEMORY_CATEGORIES 256
 #endif
 
+// extra storage for execution callbacks in global state
+#ifndef LUA_EXECUTION_CALLBACK_STORAGE
+#define LUA_EXECUTION_CALLBACK_STORAGE 512
+#endif
+
 // minimum size for the string table (must be power of 2)
 #ifndef LUA_MINSTRTABSIZE
 #define LUA_MINSTRTABSIZE 32
@@ -130,6 +137,16 @@
 
 #ifndef LUA_VECTOR_SIZE
 #define LUA_VECTOR_SIZE 3 // must be 3 or 4
+#endif
+
+#ifndef LUA_VECTOR_DOUBLE
+#define LUA_VECTOR_DOUBLE 0
+#endif
+
+#if LUA_VECTOR_DOUBLE == 1
+#define LUA_VECTOR_TYPE double
+#else
+#define LUA_VECTOR_TYPE float
 #endif
 
 #define LUA_EXTRA_SIZE (LUA_VECTOR_SIZE - 2)

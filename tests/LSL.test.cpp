@@ -35,6 +35,7 @@ extern int optimizationLevel;
 LUAU_FASTINT(CodegenHeuristicsInstructionLimit)
 LUAU_DYNAMIC_FASTFLAG(LuauCodegenTrackingMultilocationFix)
 LUAU_FASTFLAG(LuauCodegenDetailedCompilationResult)
+LUAU_FASTFLAG(LuauIntegerType2)
 
 
 static int yielding_print(lua_State* L)
@@ -334,7 +335,7 @@ TEST_CASE("Boolean And Or")
 {
     auto state = runConformance("boolean_and_or.lsl", [](lua_State *L)
         {
-            CHECK_EQ(lua_type(L, 1), LUA_TLIGHTUSERDATA);
+            CHECK_EQ(lua_type(L, 1), LUA_TINTEGER);
             int32_t actual = luaL_checkinteger(L, 1);
             int32_t expected = 0;
             switch(YIELD_NUM(L))
@@ -417,7 +418,7 @@ TEST_CASE("Comparison Operators")
 {
     auto state = runConformance("comparison.lsl", [](lua_State *L)
         {
-            CHECK_EQ(lua_type(L, 1), LUA_TLIGHTUSERDATA);
+            CHECK_EQ(lua_type(L, 1), LUA_TINTEGER);
             int32_t actual = luaL_checkinteger(L, 1);
             int32_t expected = 0;
             switch(YIELD_NUM(L))
@@ -437,6 +438,11 @@ TEST_CASE("Comparison Operators")
             return -1;
         });
     CHECK_EQ(YIELD_NUM(state.get()), 9);
+}
+
+TEST_CASE("Self Assign Comparison")
+{
+    runConformance("self_assign_comparison.lsl");
 }
 
 TEST_CASE("If Statement")
@@ -462,7 +468,7 @@ TEST_CASE("For statement")
 {
     auto state = runConformance("for.lsl", [](lua_State *L)
         {
-            CHECK_EQ(lua_type(L, 1), LUA_TLIGHTUSERDATA);
+            CHECK_EQ(lua_type(L, 1), LUA_TINTEGER);
             int32_t actual = luaL_checkinteger(L, 1);
             int32_t expected = 0;
             switch(YIELD_NUM(L))
@@ -1077,9 +1083,16 @@ TEST_CASE("Integer MulAssign Float Valid Contexts")
     runConformance("mul_assign_valid.lsl");
 }
 
-TEST_CASE("Integer Division By Zero Error")
+TEST_CASE("Division By Zero Error")
 {
     runConformance("div_by_zero.lsl", nullptr, nullptr, nullptr, "Math error");
+    runConformance("float_div_by_zero_var.lsl", nullptr, nullptr, nullptr, "Math error");
+    runConformance("float_div_by_zero_k.lsl", nullptr, nullptr, nullptr, "Math error");
+    runConformance("float_div_by_zero_k_rev.lsl", nullptr, nullptr, nullptr, "Math error");
+    runConformance("vector_div_by_zero_k.lsl", nullptr, nullptr, nullptr, "Math error");
+    runConformance("vector_div_by_zero_var.lsl", nullptr, nullptr, nullptr, "Math error");
+    runConformance("zero_vector_div_by_zero.lsl", nullptr, nullptr, nullptr, "Math error");
+    runConformance("inf_div_inf.lsl", nullptr, nullptr, nullptr, "Math error");
 }
 
 TEST_CASE("Mono Strings")
@@ -1108,6 +1121,97 @@ TEST_CASE("Mono Strings")
     // TODO: is this behavior actually desired?
     CHECK_EQ("<>", mono_to_upper_string(std::string("<\x00>", 3)));
     CHECK_EQ("<>", mono_to_lower_string(std::string("<\x00>", 3)));
+}
+
+static int get_num_table_keys(lua_State *L, int idx)
+{
+    lua_pushnil(L);
+    int num = 0;
+    while(lua_next(L, idx))
+    {
+        ++num;
+        lua_pop(L, 1);
+    }
+    return num;
+}
+
+#define require_weak_uuid_counts(L, start_idx, num_irregular, num_compressed) \
+do { \
+CHECK_EQ(get_num_table_keys(L, (start_idx)), (num_irregular)); \
+CHECK_EQ(get_num_table_keys(L, (start_idx) + 1), (num_compressed)); \
+} while (0)
+
+TEST_CASE("UUID interning (LSL)")
+{
+    auto state = runConformance("nothing.lsl");
+    lua_State *L = lua_tothread(state.get(), 1);
+    REQUIRE(L);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+
+    auto *runtime_state = (RuntimeState *)L->userdata;
+
+    int weak_idx = lua_gettop(L) + 1;
+    lua_getref(L, runtime_state->uuidWeakTab);
+    lua_getref(L, runtime_state->uuidCompressedWeakTab);
+    require_weak_uuid_counts(L, weak_idx, 0, 0);
+
+    // In LSL mode, arbitrary strings are allowed as uncompressed keys
+    for (int i=0; i<2; ++i)
+    {
+        luaSL_pushuuidstring(L, "foo");
+    }
+
+    // These should have the same pointer identity
+    CHECK_EQ(luaA_toobject(L, -1)->value.gc, luaA_toobject(L, -2)->value.gc);
+
+    require_weak_uuid_counts(L, weak_idx, 1, 0);
+    // Pop off the newest copy, run a GC and then check that this assertion still holds.
+    lua_pop(L, 1);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    require_weak_uuid_counts(L, weak_idx, 1, 0);
+
+    // It's okay to release it once there are no more reachable instances
+    lua_pop(L, 1);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    require_weak_uuid_counts(L, weak_idx, 0, 0);
+
+    // Push a UUID as well as its binary form. These should result in separate instances
+    // even though they have the same underlying string value. one is compressed and
+    // one is not, but has the same literal bytes as the backing str.
+    luaSL_pushuuidstring(L, "12345678-9abc-def0-1234-56789abcdef0");
+    luaSL_pushuuidlstring(L, "\x12\x34\x56\x78\x9a\xbc\xde\xf0\x12\x34\x56\x78\x9a\xbc\xde\xf0", 16);
+
+    require_weak_uuid_counts(L, weak_idx, 1, 1);
+
+    lua_LSLUUID *bin_uuid = (lua_LSLUUID*)lua_touserdatatagged(L, -1, UTAG_UUID);
+    lua_LSLUUID *real_uuid = (lua_LSLUUID*)lua_touserdatatagged(L, -2, UTAG_UUID);
+    CHECK_NE(bin_uuid, real_uuid);
+    CHECK_EQ(bin_uuid->str, real_uuid->str);
+
+    lua_pop(L, 1);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    require_weak_uuid_counts(L, weak_idx, 0, 1);
+    lua_pop(L, 1);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+
+    // In LSL mode, empty string stays uncompressed — (key)"" is distinct from NULL_KEY
+    luaSL_pushuuidstring(L, "");
+    lua_LSLUUID *empty_uuid = (lua_LSLUUID*)lua_touserdatatagged(L, -1, UTAG_UUID);
+    CHECK(empty_uuid != nullptr);
+    CHECK(!empty_uuid->compressed);
+    lua_pop(L, 1);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+}
+
+TEST_CASE("Deep statement nesting compiles")
+{
+    // Tailslide caps the tree's height, and the emitter has to survive whatever
+    // gets through. Statement nesting is the shape that reaches it at full
+    // depth; expressions run out of registers long before that.
+    const int depth = 4000;
+    std::string body = std::string(depth, '{') + "integer x = 1;" + std::string(depth, '}');
+    Luau::BytecodeBuilder bcb;
+    CHECK_NOTHROW(compileLSLOrThrow(bcb, "default { state_entry() { " + body + " } }"));
 }
 
 TEST_SUITE_END();

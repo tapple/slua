@@ -42,7 +42,7 @@ static const char* getName(Allocator* allocator, SyntheticNames* syntheticNames,
     char*& n = (*syntheticNames)[&gen];
     if (!n)
     {
-        std::string str = gen.explicitName ? gen.name : generateName(s);
+        std::string str = gen.explicitName ? gen.name : generateName(s, /*isForGeneric*/ true);
         n = static_cast<char*>(allocator->allocate(str.size() + 1));
         strcpy(n, str.c_str());
     }
@@ -56,7 +56,7 @@ static const char* getName(Allocator* allocator, SyntheticNames* syntheticNames,
     char*& n = (*syntheticNames)[&gen];
     if (!n)
     {
-        std::string str = gen.explicitName ? gen.name : generateName(s);
+        std::string str = gen.explicitName ? gen.name : generateName(s, /*isForGeneric*/ true);
         n = static_cast<char*>(allocator->allocate(str.size() + 1));
         strcpy(n, str.c_str());
     }
@@ -100,6 +100,8 @@ public:
             return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("boolean"), std::nullopt, Location());
         case PrimitiveType::Number:
             return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("number"), std::nullopt, Location());
+        case PrimitiveType::Integer:
+            return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("integer"), std::nullopt, Location());
         case PrimitiveType::String:
             return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("string"), std::nullopt, Location());
         case PrimitiveType::Thread:
@@ -315,7 +317,7 @@ public:
         size_t numGenerics = 0;
         for (auto it = ftv.generics.begin(); it != ftv.generics.end(); ++it)
         {
-            if (auto gtv = get<GenericType>(*it))
+            if (auto gtv = get<GenericType>(follow(*it)))
                 generics.data[numGenerics++] = allocator->alloc<AstGenericType>(Location(), AstName(gtv->name.c_str()), nullptr);
         }
 
@@ -325,7 +327,7 @@ public:
         size_t numGenericPacks = 0;
         for (auto it = ftv.genericPacks.begin(); it != ftv.genericPacks.end(); ++it)
         {
-            if (auto gtv = get<GenericTypePack>(*it))
+            if (auto gtv = get<GenericTypePack>(follow(*it)))
                 genericPacks.data[numGenericPacks++] = allocator->alloc<AstGenericTypePack>(Location(), AstName(gtv->name.c_str()), nullptr);
         }
 
@@ -437,7 +439,7 @@ public:
     {
         AstArray<AstTypeOrPack> params;
         params.size = 1;
-        params.data = static_cast<AstTypeOrPack*>(allocator->allocate(sizeof(AstType*)));
+        params.data = static_cast<AstTypeOrPack*>(allocator->allocate(sizeof(AstTypeOrPack)));
         params.data[0] = AstTypeOrPack{Luau::visit(*this, ntv.ty->ty), nullptr};
 
         return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("negate"), std::nullopt, Location(), true, params);
@@ -581,7 +583,7 @@ public:
         return result;
     }
 
-    virtual bool visit(AstStatLocal* al) override
+    bool visit(AstStatLocal* al) override
     {
         for (size_t i = 0; i < al->vars.size; ++i)
         {
@@ -604,25 +606,25 @@ public:
         return true;
     }
 
-    virtual bool visit(AstExprLocal* al) override
+    bool visit(AstExprLocal* al) override
     {
         return visitLocal(al->local);
     }
 
-    virtual bool visit(AstStatFor* stat) override
+    bool visit(AstStatFor* stat) override
     {
         visitLocal(stat->var);
         return true;
     }
 
-    virtual bool visit(AstStatForIn* stat) override
+    bool visit(AstStatForIn* stat) override
     {
         for (size_t i = 0; i < stat->vars.size; ++i)
             visitLocal(stat->vars.data[i]);
         return true;
     }
 
-    virtual bool visit(AstExprFunction* fn) override
+    bool visit(AstExprFunction* fn) override
     {
         // TODO: add generics if the inferred type of the function is generic CLI-39908
         for (size_t i = 0; i < fn->args.size; ++i)

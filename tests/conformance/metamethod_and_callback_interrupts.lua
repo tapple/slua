@@ -22,9 +22,6 @@ end
 
 -- Create test object once to avoid intermediate function calls
 local obj = create_test_object()
-local obj_len = {}
-setmetatable(obj_len, {__len = test_callback})
-
 -- Test __tostring (via luaL_callmeta path)
 reset_interrupt_test()
 local result = tostring(obj)
@@ -36,11 +33,6 @@ reset_interrupt_test()
 result = lljson.encode(obj)
 assert(result == '"ok"', "__tojson should return '\"ok\"'")
 assert(check_callback_ran(), "__tojson metamethod should have run")
-
--- Test __len (via JSON encoder when no __tojson)
-reset_interrupt_test()
-result = lljson.encode(obj_len)
-assert(check_callback_ran(), "__len metamethod should have run")
 
 -- Test arithmetic metamethods (__add, __sub, __mul, __div, __unm)
 -- These go through callTMres or luaV_callTM paths
@@ -96,5 +88,28 @@ assert(check_callback_ran(), "table.foreach callback should have run")
 reset_interrupt_test()
 local result = string.gsub(test_string, "a", test_callback)
 assert(check_callback_ran(), "string.gsub replacement function should have run")
+
+-- Coercing a numeral hands the whole string to strtod, so a long one is
+-- announced to the handler first. Built at runtime so nothing is folded.
+local long_numeral = string.rep("9", 64)
+local short_numeral = tostring(5)
+
+reset_interrupt_test()
+_ = long_numeral + 0
+assert(check_interrupt_ran(), "arithmetic on a long numeral should be announced")
+
+-- Zero iterations: 1e64 + 1 == 1e64, so a loop up to it never ends
+reset_interrupt_test()
+for _ = long_numeral, 0 do end
+assert(check_interrupt_ran(), "a long numeral as a loop bound should be announced")
+
+-- Through luaL_checknumber, once the fastcall has declined the string
+reset_interrupt_test()
+_ = math.floor(long_numeral)
+assert(check_interrupt_ran(), "a long numeral argument to a C function should be announced")
+
+reset_interrupt_test()
+_ = short_numeral + 0
+assert(not check_interrupt_ran(), "a short numeral is not worth a check")
 
 return "OK"

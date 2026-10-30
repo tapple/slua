@@ -41,31 +41,31 @@ struct UnifierSharedState
 
     InternalErrorReporter* iceHandler;
 
-    DenseHashMap<TypeId, bool> skipCacheForType{nullptr};
-    DenseHashSet<std::pair<TypeId, TypeId>, TypeIdPairHash> cachedUnify{{nullptr, nullptr}};
-    DenseHashMap<std::pair<TypeId, TypeId>, TypeErrorData, TypeIdPairHash> cachedUnifyError{{nullptr, nullptr}};
+    DenseHashMap<TypeId, bool> skipCacheForType;
+    DenseHashSet<std::pair<TypeId, TypeId>, TypeIdPairHash> cachedUnify;
+    DenseHashMap<std::pair<TypeId, TypeId>, TypeErrorData, TypeIdPairHash> cachedUnifyError;
 
-    DenseHashSet<TypeId> tempSeenTy{nullptr};
-    DenseHashSet<TypePackId> tempSeenTp{nullptr};
+    DenseHashSet<TypeId> tempSeenTy;
+    DenseHashSet<TypePackId> tempSeenTp;
 
     UnifierCounters counters;
 
     bool reentrantTypeReduction = false;
 };
 
-struct TypeReductionRentrancyGuard final
+struct TypeReductionReentrancyGuard final
 {
-    explicit TypeReductionRentrancyGuard(NotNull<UnifierSharedState> sharedState)
+    explicit TypeReductionReentrancyGuard(NotNull<UnifierSharedState> sharedState)
         : sharedState{sharedState}
     {
         sharedState->reentrantTypeReduction = true;
     }
-    ~TypeReductionRentrancyGuard()
+    ~TypeReductionReentrancyGuard()
     {
         sharedState->reentrantTypeReduction = false;
     }
-    TypeReductionRentrancyGuard(const TypeReductionRentrancyGuard&) = delete;
-    TypeReductionRentrancyGuard(TypeReductionRentrancyGuard&&) = delete;
+    TypeReductionReentrancyGuard(const TypeReductionReentrancyGuard&) = delete;
+    TypeReductionReentrancyGuard(TypeReductionReentrancyGuard&&) = delete;
 
 private:
     NotNull<UnifierSharedState> sharedState;

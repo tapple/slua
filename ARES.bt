@@ -4,11 +4,12 @@
 //      File: ARES.bt
 //   Authors: Harold Cindy
 //   Version: 
-//   Purpose: dissecting serialized Ares chunks
-//  Category: 
-// File Mask: *.ares
-//  ID Bytes: 41 52 45 53
-//   History: 
+//   Purpose: dissecting serialized Ares chunks, bare or inside an
+//            Executor state payload
+//  Category:
+// File Mask: *.ares,*.state
+//  ID Bytes: 41 52 45 53, 45 58 45 43
+//   History:
 //------------------------------------------------
 // This file originally based on Eris' FILEFORMAT file
 
@@ -21,6 +22,7 @@ typedef uint32 uint32_t;
 typedef uint64 uint64_t;
 typedef int16 int16_t;
 typedef int32 int32_t;
+typedef int64 int64_t;
 // Note that in the context of Ares size_t is _always_ 64-bit!
 typedef uint64 size_t;
 typedef size_t ProtoPtr;
@@ -30,64 +32,72 @@ const uchar UTAG_UUID = 26;
 const uchar UTAG_DETECTED_EVENT = 28;
 const uchar UTAG_LLEVENTS = 29;
 const uchar UTAG_LLTIMERS = 30;
+const uchar UTAG_STRBUF = 31;
+const uchar UTAG_OPAQUE_BUFFER = 32;
+const uchar UTAG_YIELD_STATE = 33;
+const uchar UTAG_ARES_TEST = 34;
+/* LUA_UTAG_LIMIT + 1, see ludata.h */
+const uchar UTAG_PROXY = 129;
 
-#define LUA_TNONE		(-1)
+/* One SlotManager's region of a UTAG_YIELD_STATE buffer, see the layout
+ * comment in VM/include/lyieldable.h. The innermost flag says whether this
+ * was the deepest active manager. */
+typedef struct {
+    uint16 length;           /* Slots plus the innermost flag */
+    uchar slots[length - 1];
+    uint8_t innermost;
+} YieldRegion;
 
-#define LUA_TNIL		0
-#define LUA_TBOOLEAN		1
-#define LUA_TLIGHTUSERDATA	2
-#define LUA_TNUMBER		3
-#define LUA_TVECTOR		4
-#define LUA_TSTRING		5
-#define LUA_TTABLE		6
-#define LUA_TFUNCTION		7
-#define LUA_TUSERDATA		8
-#define LUA_TTHREAD		9
-#define LUA_TBUFFER		10
-#define LUA_NUMTAGS		11
+/* The root manager's region: its slots are led by the frame-relative stack
+ * top to restore on resume, 0 when there is nothing to restore. */
+typedef struct {
+    uint16 length;           /* Stack top, slots, and the innermost flag */
+    uint16 stack_top;
+    uchar slots[length - 3];
+    uint8_t innermost;
+} YieldRootRegion;
 
-#define LUA_TPROTO	LUA_NUMTAGS
-#define LUA_TUPVAL	(LUA_NUMTAGS+1)
-#define LUA_TDEADKEY	(LUA_NUMTAGS+2)
-
-/*
-** number of all possible tags (including LUA_TNONE but excluding DEADKEY)
-*/
-#define LUA_TOTALTAGS	(LUA_TUPVAL+1)
-
-#define ERIS_PERMANENT (LUA_TOTALTAGS + 1)
-#define ERIS_REFERENCE (ERIS_PERMANENT + 1)
-
+/* Mirrors enum AresType in VM/src/ares.cpp. These are wire values and are
+ * assigned explicitly there - do not derive them from Luau's lua_Type. */
 typedef enum <uint8_t> {
-    ET_NIL = LUA_TNIL,
-    ET_BOOLEAN = LUA_TBOOLEAN,
-    ET_LIGHTUSERDATA = LUA_TLIGHTUSERDATA,
-    ET_NUMBER = LUA_TNUMBER,
-    ET_VECTOR = LUA_TVECTOR,
-    ET_STRING = LUA_TSTRING,
-    ET_TABLE = LUA_TTABLE,
-    ET_FUNCTION = LUA_TFUNCTION,
-    ET_USERDATA = LUA_TUSERDATA,
-    ET_THREAD = LUA_TTHREAD,
-    ET_BUFFER = LUA_TBUFFER,
-    ET_PROTO = LUA_TPROTO,
-    ET_UPVAL = LUA_TUPVAL,
-    ET_TDEADKEY = LUA_TDEADKEY,
-    ET_PERMANENT = ERIS_PERMANENT,
-    ET_REFERENCE = ERIS_REFERENCE,
-} ErisType;
+    ARES_T_NIL = 0,
+    ARES_T_BOOLEAN = 1,
+    ARES_T_LIGHTUSERDATA = 2,
+    ARES_T_NUMBER = 3,
+    ARES_T_INTEGER = 4,
+    ARES_T_VECTOR = 5,
 
-// thread status; 0 is OK
+    ARES_T_STRING = 16,
+    ARES_T_TABLE = 17,
+    ARES_T_FUNCTION = 18,
+    ARES_T_USERDATA = 19,
+    ARES_T_THREAD = 20,
+    ARES_T_BUFFER = 21,
+    ARES_T_CLASS = 22,
+    ARES_T_OBJECT = 23,
+    ARES_T_VECTORD = 24,
+
+    ARES_T_DEADKEY = 40,
+    ARES_T_PROTO = 41,
+    ARES_T_UPVAL = 42,
+
+    ARES_T_PERMANENT = 64,
+    ARES_T_REFERENCE = 65,
+} AresType;
+
+/* Mirrors enum AresStatus in VM/src/ares.cpp. Like the type tags these are
+ * wire values, not Luau's lua_Status. */
 typedef enum <uint8_t>
 {
-    LUA_OK = 0,
-    LUA_YIELD,
-    LUA_ERRRUN,
-    LUA_ERRSYNTAX,
-    LUA_ERRMEM,
-    LUA_ERRERR,
-    LUA_BREAK, // yielded for a debug breakpoint
-} lua_Status;
+    ARES_S_OK = 0,
+    ARES_S_YIELD = 1,
+    ARES_S_ERRRUN = 2,
+    ARES_S_ERRSYNTAX = 3,
+    ARES_S_ERRMEM = 4,
+    ARES_S_ERRERR = 5,
+    ARES_S_BREAK = 6, // yielded for a debug breakpoint
+    ARES_S_ERRKILL = 7, // uncatchable script termination error
+} AresStatus;
 
 typedef enum <uint8_t> eris_CIKind {
     ERIS_CI_KIND_NONE = 0,
@@ -101,15 +111,6 @@ typedef enum <uint8_t> eris_CIKind {
 #define LUA_CALLINFO_RETURN (1 << 0) // should the interpreter return after returning from this callinfo? first frame must have this set
 #define LUA_CALLINFO_HANDLE (1 << 1) // should the error thrown during execution get handled by continuation from this callinfo? func must be C
 #define LUA_CALLINFO_NATIVE (1 << 2) // should this function be executed using execution callback for native code
-
-/* thread status */
-#define LUA_OK		0
-#define LUA_YIELD	1
-#define LUA_ERRRUN	2
-#define LUA_ERRSYNTAX	3
-#define LUA_ERRMEM	4
-#define LUA_ERRGCMM	5
-#define LUA_ERRERR	6
 
 struct Header;
 struct Object;
@@ -126,7 +127,50 @@ struct PermKey;
 struct Upvaldesc;
 struct LocVar;
 struct CallInfo;
+struct ExecString;
 
+
+/* Counts, sizes and indices are the unsigned LEB128 varints Luau bytecode
+ * uses, see write_uvarint() in ares.cpp. `v` is the decoded value. */
+typedef struct {
+    local uint64 v = 0;
+    local int shift = 0;
+    local uchar cur;
+    do {
+        cur = ReadUByte(FTell());
+        uchar raw;
+        v |= (uint64)(cur & 0x7F) << shift;
+        shift += 7;
+    } while (cur & 0x80);
+} UVarint <read=Str("%Lu", this.v)>;
+
+/* An `int` field: the same encoding, holding the 32-bit two's complement. */
+typedef struct {
+    local uint64 v = 0;
+    local int shift = 0;
+    local uchar cur;
+    do {
+        cur = ReadUByte(FTell());
+        uchar raw;
+        v |= (uint64)(cur & 0x7F) << shift;
+        shift += 7;
+    } while (cur & 0x80);
+} IntVarint <read=Str("%d", (int32)this.v)>;
+
+/* A genuinely signed field: 64-bit zigzag varint, see write_ares_sint() in
+ * ares.cpp. Integer payloads and the two signed CallInfo fields use it. */
+typedef struct {
+    local uint64 v = 0;
+    local int shift = 0;
+    local uchar cur;
+    do {
+        cur = ReadUByte(FTell());
+        uchar raw;
+        v |= (uint64)(cur & 0x7F) << shift;
+        shift += 7;
+    } while (cur & 0x80);
+    local int64 s = (int64)(v >> 1) ^ -(int64)(v & 1);
+} SVarint <read=Str("%Ld", this.s)>;
 
 // From LuauBytecode.bt
 typedef enum <uint32> {
@@ -375,8 +419,13 @@ typedef enum <uint32> {
     // A: target register (see FORGLOOP for register layout)
     LOP_FORGPREP_INEXT,
 
-    // removed in v3
-    LOP_DEP_FORGLOOP_INEXT,
+    // FASTCALL3: perform a fast call of a built-in function using 3 register arguments
+    // A: builtin function id (see LuauBuiltinFunction)
+    // B: source argument register
+    // C: jump offset to get to following CALL
+    // AUX: source register 2 in least-significant byte
+    // AUX: source register 3 in second least-significant byte
+    LOP_FASTCALL3,
 
     // FORGPREP_NEXT: prepare FORGLOOP with 2 output variables (no AUX encoding), assuming generator is luaB_next, and jump to FORGLOOP
     // A: target register (see FORGLOOP for register layout)
@@ -490,14 +539,71 @@ typedef enum <uint32> {
     // C: constant table index (0..255)
     LOP_IDIVK,
 
+    // Atom-based userdata field access acceleration
+    // These are equivalent to their GETTABLEKS/SETTABLEKS/NAMECALL counterparts, except tailored towards userdata field accesses
+    // If the user has registered metamethods for a userdata tag, callbacks will be called by these instructions
+    // NOTE: it uses only lower 2 bytes in AUX for constant index. Higher bytes are used for runtime cache.
+    LOP_GETUDATAKS,
+    LOP_SETUDATAKS,
+    LOP_NAMECALLUDATA,
+
+    // NEWCLASSMEMBER: register this method on a class object.
+    // A: target register of class
+    // B: reserved
+    // C: initial value of this member. currently must be a function.
+    // AUX: The name of this member as a constant string
+    LOP_NEWCLASSMEMBER,
+
+    // CALLFB: call specified function with collecting runtime stats in a feedback slot
+    // A: register where the function object lives, followed by arguments; results are placed starting from the same register
+    // B: argument count + 1, or 0 to preserve all arguments up to top (MULTRET)
+    // C: result count + 1, or 0 to preserve all values and adjust top (MULTRET)
+    // AUX: feedback slot id. 0xFFFFFFFF - sealed
+    LOP_CALLFB,
+
+    // CMPPROTO: check if a register contains a closure with a specified Luau function proto id
+    // A: closure register
+    // D: jump offset if proto doesn't match
+    // AUX: proto id
+    LOP_CMPPROTO,
+
+    // FASTPCALL: perform a fastcall of a built-in protected call function
+    // A: protected function id (0 - pcall, 1 - xpcall)
+    // B: number of explicit arguments before a variadic tail
+    // C: jump offset to get to following CALL
+    LOP_FASTPCALL,
+
+    // The following instructions appear only in experimental bytecode versions and are subject to change
+
+    // NEWCLASS: reify a class object
+    // A: target register of class
+    // B: source register of superclass, or 0xFF if no superclass
+    // C: bottom bit is 1 if the class is open, else 0; upper 7 bits are reserved
+    // AUX: constant table index of unreified class object
+    LOP_NEWCLASS,
+
+    // CONSTRUCT: duplicate table to ra using the constant table template specified in the feedback slot
+    // A: target register
+    // B: register that is likely to hold a class
+    // C: reserved
+    // AUX: feedback slot id
+    LOP_CONSTRUCT,
+
+    // FINCONSTRUCT: checks if object construction initiated by a preceding CONSTRUCT succeeded
+    // A: source register
+    // B: reserved
+    // C: jump offset to get to following CALL
+    LOP_FINCONSTRUCT,
+
     LOP__COUNT,
 
-    LOP__LSL_START = 200,
+    // LSL-specific opcodes, numbered high so they don't collide with Luau's
+    LOP_LSL__START = 200,
 
     // LSL_DOUBLE2FLOAT: truncate double to 32-bit float range
     // A: target register
     // B: source register
-    LOP_LSL_DOUBLE2FLOAT,
+    LOP_LSL_DOUBLE2FLOAT = LOP_LSL__START,
 
     // LSL_CASTINTFLOAT: convert between LSL integer and float
     // A: target register
@@ -505,12 +611,12 @@ typedef enum <uint32> {
     // C: direction (0 = int->float, 1 = float->int)
     LOP_LSL_CASTINTFLOAT,
 
-    LOP__LSL_END
+    LOP_LSL__END = LOP_LSL_CASTINTFLOAT
 } LuauOpCode;
 
 string ReadInstruction(uint32 o) {
     local uint32 shifted_o = (o & 255);
-    if (shifted_o >= LOP__COUNT)
+    if (shifted_o >= LOP__COUNT && (shifted_o < LOP_LSL__START || shifted_o > LOP_LSL__END))
         return Str("%u", o);
     local LuauOpCode en_o = shifted_o;
     return EnumToString(en_o);
@@ -522,29 +628,69 @@ typedef uint32 Instruction <read=ReadInstruction>;
 local uint64 refNum = 0;
 // tracks where we saw each reference
 local uint64 refPositions[0xFFFF] = {0};
+// string table entries parsed so far, and where each one's bytes start
+local uint64 strNum = 0;
+local uint64 strPositions[0xFFFF] = {0};
+local uint64 strLengths[0xFFFF] = {0};
+
+/* A block holding a later feature's fields, see BlockWriter in ares.cpp.
+ * This template knows no features yet, so every body shows as raw bytes;
+ * features 64 and 65 are UTAG_ARES_TEST's, 66 and 67 the testpad setting's. */
+typedef struct {
+    uint8_t feature <bgcolor=cLtGreen>;
+    uint32_t length;
+    if (length)
+        uchar body[length] <bgcolor=cSilver>;
+} Block <read=Str("feature %u, %u bytes", this.feature, this.length)>;
+
+/* Closes a length-prefixed record: anything left before record_end is blocks,
+ * which a reader walks in stream order, skipping the features it doesn't
+ * know. Declarations leak into the calling struct. */
+void ParseRecordEnd(int64 record_end) {
+    while (FTell() < record_end) {
+        Block block <optimize=false>;
+    }
+    Assert(FTell() == record_end);
+}
 
 typedef struct {
     char sig[4] <bgcolor=0x33aaff>;   /* Header signature for rudimentary validation */
     Assert(sig == "ARES");
-    uint32_t version;
+    uint32_t major;
+    uint32_t minor;
+    /* Mirrors ARES_FORMAT_MAJOR in VM/include/lua.h. Any minor under it
+     * parses: later fields only ever go in blocks at the end of a record. */
+    Assert(major == 7);
+    uint32_t record_len;
+    local int64 record_end = FTell() + record_len;
     uint8_t sizeof_number;  /* sizeof(lua_Number) to check type compatibility */
     lua_Number test;    /* -1.234567890 to check representation compatibility */
-    uint8_t sizeof_int; /* sizeof(int) in persisted data */
-    uint8_t sizeof_size_t;  /* sizeof(size_t) in persisted data */
     uint8_t vector_components; /* how many components are stored in vectors */
-    /* Note that the last two fields determine the size of the int and size_t
-     * fields in the following definitions. We write each value in the native
-     * "size" and check for truncation when reading, if necessary. */
+    /* The root is serialized to a scratch buffer before the header is
+     * written, so this is final. Strings do not count. */
+    uint32_t final_refcount;
+    /* The features a reader has to understand, bit n for feature n: those
+     * whose blocks were written BLOCK_REQUIRED. An unknown bit here refuses
+     * the stream. */
+    uint64_t features_required;
+    ParseRecordEnd(record_end);
 } Header <bgcolor=cLtRed>;
 
-// Define this up here so structs can reference the version
-Header header;      /* The header used for basic validation. */
+// GC object header with memcat.
+// Declarations leak into the calling struct.
+void ParseGCHeader() {
+    uint8_t memcat <bgcolor=cLtYellow>;
+}
 
 string ReadObject(Object &o) {
+    if (o.type == ARES_T_STRING) {
+        return Str("%s $%Lu \"%s\"", EnumToString(o.type), o.val.v,
+                   ReadString(strPositions[o.val.v], strLengths[o.val.v]));
+    }
     // ref should be non-zero if present
     if (o.ourRef) {
-        // ET_REFERENCE refNums are references _to_ something
-        if (o.type == ET_REFERENCE) {
+        // ARES_T_REFERENCE refNums are references _to_ something
+        if (o.type == ARES_T_REFERENCE) {
             return Str("%s -> #%d @%d", EnumToString(o.type), o.ourRef, refPositions[o.ourRef]);
         }
         return Str("%s #%d", EnumToString(o.type), o.ourRef);
@@ -556,91 +702,147 @@ typedef struct {
     // What the logical reference number of this object will be, note that this is
     // implicit and based on parse order of `Object`s!
     local int ourRef = 0;
-    ErisType type <bgcolor=cLtBlue>;
+    AresType type <bgcolor=cLtBlue>;
     switch(type) {
         // some kinds of things don't need reference to them stored, though
         // storing references would be a waste because they're so small.
-        case ET_NIL:
-        case ET_BOOLEAN:
-        case ET_LIGHTUSERDATA:
-        case ET_NUMBER:
-        case ET_VECTOR:
+        case ARES_T_NIL:
+        case ARES_T_BOOLEAN:
+        case ARES_T_LIGHTUSERDATA:
+        case ARES_T_NUMBER:
+        case ARES_T_INTEGER:
+        case ARES_T_VECTOR:
         // storing a reference to a reference? no.
-        case ET_REFERENCE:
-        // permanent never writes to the ref table, what would be the point?
-        case ET_PERMANENT:
+        case ARES_T_REFERENCE:
+        // strings are indexes into the string table, not references
+        case ARES_T_STRING:
             break;
+        // Permanents take a number too: persist_keyed() allocates it before
+        // the permanents table gets a look, and u_permanent() reserves it
+        // before reading the key, so the key's own objects number after it.
         default: {
             ourRef = ++refNum;
             // track where we saw this so we can show the address of what's
-            // being referenced in ET_REFERENCEs
+            // being referenced in ARES_T_REFERENCEs
             refPositions[refNum] = startof(this);
         }
     }
 
+    // Mirrors type_is_framed() in ares.cpp: the VM-shaped bodies carry a
+    // length word so a reader can step over fields it doesn't know.
+    local int64 record_end = -1;
     switch(type) {
-        case ET_NIL:
+        case ARES_T_TABLE:
+        case ARES_T_FUNCTION:
+        case ARES_T_USERDATA:
+        case ARES_T_THREAD:
+        case ARES_T_PROTO:
+        case ARES_T_UPVAL:
+        case ARES_T_CLASS:
+        case ARES_T_OBJECT:
+            uint32_t record_len <bgcolor=cLtGray>;
+            record_end = FTell() + record_len;
             break;
-        case ET_BOOLEAN:
-            int32_t val; break;
-        case ET_LIGHTUSERDATA:
+    }
+
+    switch(type) {
+        case ARES_T_NIL:
+            break;
+        case ARES_T_BOOLEAN:
+            IntVarint val; break;
+        case ARES_T_LIGHTUSERDATA:
             LightUserdata val; break;
-        case ET_NUMBER:
+        case ARES_T_NUMBER:
             Number val; break;
-        case ET_VECTOR:
+        case ARES_T_INTEGER:
+            SVarint val; break;
+        case ARES_T_VECTOR:
             float val[3]; break;
-        case ET_STRING:
-            String val; break;
-        case ET_TABLE:
+        /* Reserved but never emitted; p_vector refuses to write f64 vectors
+         * until they go through the GC object path. */
+        case ARES_T_VECTORD:
+            ParseGCHeader();
+            double val[3]; break;
+        case ARES_T_STRING:
+            /* 1-based index into the string table ahead of the root */
+            UVarint val <bgcolor=cLtGreen>; break;
+        case ARES_T_TABLE:
             Table val; break;
-        case ET_FUNCTION:
+        case ARES_T_FUNCTION:
             Closure val; break;
-        case ET_USERDATA:
+        case ARES_T_USERDATA:
             Userdata val; break;
-        case ET_THREAD:
+        case ARES_T_THREAD:
             Thread val; break;
-        case ET_BUFFER:
+        case ARES_T_BUFFER:
             Buffer val; break;
-        case ET_PROTO:
+        case ARES_T_PROTO:
             Proto val; break;
-        case ET_UPVAL:
+        case ARES_T_UPVAL:
             UpVal val; break;
-        case ET_PERMANENT:
+        case ARES_T_PERMANENT:
             PermKey val; break;
-        case ET_REFERENCE:
+        case ARES_T_REFERENCE:
             /* If the object is not primitive (see list above) we remember it and
              * increment the reference counter, and point any future occurrences of
              * it to this one via a reference (see above, Reference r). */
             /* Note that the types LUA_TNIL, LUA_TBOOLEAN, LUA_TNUMBER and
              * LUA_TLIGHTUSERDATA will never be "referenced", but always be written
              * directly. */
-            uint32 reference <bgcolor=cLtGreen>; /* The index the object was referenced with */
-            ourRef = reference;
+            IntVarint reference <bgcolor=cLtGreen>; /* The index the object was referenced with */
+            ourRef = reference.v;
             break;
+        case ARES_T_CLASS:
+        case ARES_T_OBJECT:
+            /* Framed, but ares.cpp has no body for these yet. */
+            Assert(0);
         default:
             Assert(0);
     }
+
+    if (record_end >= 0)
+        ParseRecordEnd(record_end);
 } Object<optimize=false, bgcolor=cLtPurple, read=ReadObject>;
 
+/* A string table entry. Every string the root reaches, in first-sight order. */
 typedef struct {
-    size_t length;      /* The length of the string */
-    char str[length];   /* The actual string (not always null terminated) */
-} String <read=this.str>;
+    ParseGCHeader();
+    UVarint length;     /* The length of the string */
+    /* Where the bytes start, whether or not there are any */
+    local int64 str_start = FTell();
+    char str[length.v];   /* The actual string (not always null terminated) */
+    strNum++;
+    strPositions[strNum] = str_start;
+    strLengths[strNum] = length.v;
+} String <read=(exists(this.str) ? this.str : "")>;
 
 typedef struct {
-    size_t length;      /* The length of the buffer */
-    char data[length];   /* The actual buffer data */
-} Buffer <read=this.data>;
+    uint32_t record_len <bgcolor=cLtGray>;
+    local int64 record_end = FTell() + record_len;
+    UVarint count;
+    local int i;
+    for (i = 0; i < count.v; ++i) {
+        String entry;
+    }
+    ParseRecordEnd(record_end);
+} StrTab <optimize=false>;
+
+typedef struct {
+    ParseGCHeader();
+    UVarint length;     /* The length of the buffer */
+    char data[length.v];   /* The actual buffer data */
+} Buffer <read=(exists(this.data) ? this.data : "")>;
 
 struct Table {
+    ParseGCHeader();
     uint8_t read_only;
     uint8_t safe_env;
-    int array_size;
-    int node_size;
+    IntVarint array_size;
+    IntVarint node_size;
     local int i;
     // This serialization format preserves `nil` holes, so we can't use `nil` as a
     // terminator.
-    for (i=0; i<(array_size+node_size); ++i) {
+    for (i=0; i<(array_size.v+node_size.v); ++i) {
         /* key/value pairs */
         struct Pair {
             /* Both of these may legally be `nil` due to hole preservation */
@@ -654,9 +856,24 @@ struct Table {
 
 
 typedef struct {
+    ParseGCHeader();
     uint8_t utag;       /* Userdata tag */
     switch(utag)
     {
+    case UTAG_PROXY:
+    {
+        /* Always empty, newproxy() makes no others. The only tag whose
+         * metatable is the script's rather than the tag registry's. */
+        Object metatable;
+        break;
+    }
+    case UTAG_QUATERNION:
+    {
+        /* Raw float[4], see llsl.cpp */
+        UVarint length;
+        float q[4];
+        break;
+    }
     case UTAG_UUID:
     {
         Object data;
@@ -664,7 +881,7 @@ typedef struct {
     }
     case UTAG_DETECTED_EVENT:
     {
-        int32_t index;
+        IntVarint index;
         uint8_t valid;
         uint8_t can_change_damage;
         break;
@@ -681,21 +898,52 @@ typedef struct {
         Object tick_wrapper;
         break;
     }
+    case UTAG_STRBUF:
+    {
+        UVarint capacity;
+        UVarint used;
+        uchar data[used.v];
+        break;
+    }
+    case UTAG_YIELD_STATE:
+    {
+        UVarint length;
+        local int64 end = FTell() + length.v;
+        uint8_t abi_version; /* The frame's continuation must answer with at least this */
+        YieldRootRegion root;
+        local int innermost = root.innermost;
+        while (!innermost)
+        {
+            YieldRegion region;
+            innermost = region.innermost;
+        }
+        /* A buffer reused from an earlier yield can be larger than the chain */
+        if (FTell() < end)
+            uchar slack[end - FTell()];
+        break;
+    }
+    case UTAG_ARES_TEST:
+    {
+        /* Its other fields are in blocks */
+        IntVarint base;
+        break;
+    }
+    case UTAG_OPAQUE_BUFFER:
     default:
     {
-        size_t length;      /* Size of the data */
-        uchar data[length]; /* The actual data */
+        UVarint length;      /* Size of the data */
+        uchar data[length.v]; /* The actual data */
     }
     }
-    Object metatable;   /* The metatable (nil for none, otherwise LUA_TTABLE) */
 } Userdata<optimize=false>;
 
 typedef struct {
     uint8_t lutag;       /* Userdata tag */
-    size_t ptr;
+    uint64_t ptr;        /* Pointer-sized, so fixed width rather than a varint */
 } LightUserdata <read=Str("%c : %Lu", this.lutag, this.ptr)>;
 
 struct Closure {
+    ParseGCHeader();
     uint8_t isCClosure; /* 1 if the closure is a C closure; 0 otherwise */
     uint8_t nups;       /* Number of upvalues the function uses */
     if (isCClosure) {
@@ -725,7 +973,7 @@ struct Proto {
 
     Object source;      /* Textual source for the function, string or nil */
 
-    int bytecode_id;
+    IntVarint bytecode_id;
 
     uint8_t maxstacksize;   /* Size of stack reserved for the function */
     uint8_t flags;      /* Flags related to the function definition */
@@ -733,16 +981,16 @@ struct Proto {
     uint8_t nups;       /* Number of upvalues */
     uint8_t is_vararg;  /* 1 if function accepts varargs, 0 otherwise */
 
-    int sizecode;       /* Number of instructions in code */
-    Instruction code[sizecode]; /* The proto's code */
+    IntVarint sizecode; /* Number of instructions in code */
+    Instruction code[sizecode.v]; /* The proto's code */
 
-    int sizek;          /* Number of constants referenced */
-    Object k[sizek];    /* Constants referenced */
+    IntVarint sizek;    /* Number of constants referenced */
+    Object k[sizek.v];  /* Constants referenced */
 
-    int sizep;          /* Number of inner Protos referenced */
-    Object p[sizep];    /* Inner Protos referenced */
+    IntVarint sizep;    /* Number of inner Protos referenced */
+    Object p[sizep.v];  /* Inner Protos referenced */
 
-    int linedefined;    /* Start of line range */
+    IntVarint linedefined;    /* Start of line range */
     Object debugname;   /* Name of the function for debugging, string or nil */
 
     // Neither of these are supported yet.
@@ -768,67 +1016,151 @@ struct Proto {
         Object upvalnames[sizeupvalues];    /* Upvalue names */
     }
 
-    int sizeyieldpoints;
-    int yieldpoints[sizeyieldpoints];
+    IntVarint sizeyieldpoints;
+    local int yp;
+    for (yp = 0; yp < sizeyieldpoints.v; ++yp) {
+        IntVarint yieldpoint;
+    }
 };
 
 struct Thread {
+    ParseGCHeader();
     Object env;
-    int stacksize;      /* The overall size of the stack filled with objects,
-                         * including all stack frames. */
-    size_t top;         /* top = L->top - L->stack; */
-    Object stack[top];    /* All stack values, bottom up */
+    UVarint stacksize;  /* Allocated stack slots, restored as-is */
+    UVarint top;        /* top = L->top - L->stack; */
+    Object stack[top.v];    /* All stack values, bottom up */
 
-    lua_Status status;     /* current thread status (ok, yield) */
-    size_t errfunc;     /* NOT USED current error handling function (stack index) */
+    AresStatus status;     /* current thread status (ok, yield) */
+    uint8_t activememcat <bgcolor=cLtYellow>;
+    Object namecall;    /* The pending namecall string, nil for none */
 
-    int32_t num_cis;        /* number of callinfo frames */
-    /* The CallInfo stack, starting with base_ci */
+    UVarint size_ci;    /* Allocated callinfo slots, never below BASIC_CI_SIZE */
+    UVarint num_cis;    /* number of callinfo frames */
+    /* The CallInfo stack, starting with base_ci. Each frame is its own record. */
     struct CallInfo {
-        size_t func;        /* func = ci->func - thread->stack */
-        size_t top;         /* top = ci->top - thread->stack */
-        size_t base;        /* base = ci->base - thread-stack */
-        int32_t nresults;   /* expected number of results from this function */
+        uint32_t record_len <bgcolor=cLtGray>;
+        local int64 record_end = FTell() + record_len;
+        UVarint func;       /* func = ci->func - thread->stack */
+        UVarint top;        /* top = ci->top - thread->stack */
+        UVarint base;       /* base = ci->base - thread-stack */
+        SVarint nresults;   /* expected number of results from this function, -1 for MULTRET */
         uint8_t flags;      /* What to do after completing this call, see lstate.h */
         eris_CIKind ci_kind;/* What kind of CallInfo this is */
 
         if (ci_kind == ERIS_CI_KIND_LUA) {
-            int yield_point;
-            int savedpc; /* savedpc = ci->u.l.savedpc - ci_func(ci)->p->code */
+            SVarint yield_point;  /* -1 on an errored thread */
+            IntVarint savedpc; /* savedpc = ci->u.l.savedpc - ci_func(ci)->p->code */
         } else if (ci_kind == ERIS_CI_KIND_C) {
-            //uint8_t status;
-            //if (callstatus & (CIST_YPCALL | CIST_YIELDED)) {
-            //    int32_t ctx;  /* context info. in case of yields */
-            //    Object k;     /* C function, callback for resuming */
-            //}
+            IntVarint errfunc;  /* pcall's error handler, 1-based from ci->base, 0 for none */
             Object function;
         } else {
             Assert(ci_kind == ERIS_CI_KIND_NONE);
         }
-    } ci[num_cis] <bgcolor=cLtAqua, optimize=false>;
-
-    if (status == LUA_YIELD) {
-        // size_t extra;   /* value of thread->ci->extra, which is the original
-        //                 * value of thread->ci->func */
-    }
+        ParseRecordEnd(record_end);
+    } ci[num_cis.v] <bgcolor=cLtAqua, optimize=false>;
 
     while (TRUE) {
         struct OpenUpval {
-            size_t idx;         /* stack index of the value + 1; 0 if end of list */
-            if (idx)
+            UVarint idx;        /* stack index of the value + 1; 0 if end of list */
+            if (idx.v)
                 Object upval;       /* The upvalue */
         } openupval <optimize=false>;
-        if (!openupval.idx)
+        if (!openupval.idx.v)
             break;
     }
 };
 
 struct PermKey {
-    ErisType type;   /* The actual LUA_TXXX of the original value. */
+    AresType type;   /* The actual tag of the original value. */
     Object key;     /* The value to use as a key when unpersisting. */
     /* Note that we store the type of the original value (replaced by the
      * permanent table value used as a key when unpersisting) to ensure the
      * value in the permanents table when unpersisting has the correct type. */
 };
 
-Object rootobj;     /* The root object that was persisted. */
+typedef struct {
+    refNum = 0;
+    strNum = 0;
+    Header header;
+    StrTab strtab;      /* Read in full before the root, see u_strtab() */
+    Object rootobj;     /* The root object that was persisted. */
+    /* The same check the reader makes in u_finish() */
+    if (refNum != header.final_refcount)
+    {
+        Printf("refNum != header.final_refcount, %d != %d\n", refNum, header.final_refcount);
+        Assert(0);
+    }
+} AresStream;
+
+/* Length-prefixed string as written by ByteWriter::writeString */
+typedef struct {
+    uint32_t length;
+    char str[length];
+} ExecString <read=(exists(this.str) ? this.str : "")>;
+
+/* The wrapper Script::serializeState() puts around an Ares blob, see
+ * Executor/src/Script.cpp. Later fields only ever go in blocks at the end of
+ * the two sections, so a newer minor parses. */
+typedef struct {
+    /* The base class's fingerprint, covering the core section. Mirrors
+     * kScriptStateFingerprint in Executor/include/Luau/Script.h. */
+    char tag[4] <bgcolor=0x33aaff>;
+    Assert(tag == "EXEC");
+    uint32_t major;
+    uint32_t minor;
+    Assert(major == 3);
+    /* The core section's required feature mask: the blocks a reader has to
+     * understand. Zero until a feature exists; a nonzero mask is refused. */
+    uint64_t features_required;
+    /* The concrete Script subclass's fingerprint (EXEC again for the base
+     * class), covering the extra section at the end, with its own mask. */
+    char class_tag[4] <bgcolor=0x33aaff>;
+    uint32_t class_major;
+    uint32_t class_minor;
+    uint64_t class_features_required;
+
+    struct CoreSection {
+        uint32_t record_len <bgcolor=cLtGray>;
+        local int64 record_end = FTell() + record_len;
+        float sleep;
+        uint32_t memory_limit;
+        uint8_t fault_kind;
+        ExecString fault_string;
+        ExecString extended_fault_string;
+        uint8_t main_function_complete;
+        uint8_t is_lsl;
+        uint32_t api_version;
+        /* The indra registers, opaque bitfields in the asset header's mask
+         * space (bit n-1 is builtins.txt event n). */
+        int32_t current_state;
+        int32_t next_state;
+        uint64_t current_handler;
+        uint64_t sticky_handler;
+        uint64_t current_events;
+        uint64_t event_handlers;
+        ParseRecordEnd(record_end);
+    } core <bgcolor=cLtGreen>;
+
+    uint32_t ares_length;
+    local int64 ares_end = FTell() + ares_length;
+    AresStream ares;
+    Assert(FTell() == ares_end);
+
+    /* Subclass state, versioned by class_major/class_minor. The base Script
+     * writes nothing here, so the layout is whatever serializeExtra() chose. */
+    struct ExtraSection {
+        uint32_t record_len <bgcolor=cLtGray>;
+        if (record_len > 0)
+            uchar data[record_len];
+    } extra;
+} ExecState;
+
+local string magic = ReadString(0, 4);
+if (magic == "EXEC")
+    ExecState exec;
+else if (magic == "ARES")
+    AresStream ares;
+else
+    Assert(0);
+/* Both readers refuse trailing bytes */
+Assert(FEof());

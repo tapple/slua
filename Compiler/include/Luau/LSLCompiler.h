@@ -52,15 +52,24 @@ protected:
     LuauSymbolMap *_mSymData = nullptr;
     uint32_t _mTopFuncID = 0;
     uint32_t _mTopStateID = 0;
+    // One handled-events mask per state, indexed by state number
+    std::vector<uint64_t> _mStateMasks;
+
+public:
+    const std::vector<uint64_t> &getStateMasks() const { return _mStateMasks; }
 };
 
 
 class LuauVisitor : public ASTVisitor
 {
 public:
-    explicit LuauVisitor(Luau::BytecodeBuilder *builder, LuauSymbolMap &symbol_map);
+    explicit LuauVisitor(Luau::BytecodeBuilder *builder, LuauSymbolMap &symbol_map, bool debug_lines = false);
 
 protected:
+    // With debug lines on, each node's line is set on the builder around its
+    // visit so every instruction carries the LSL line it came from
+    bool visitSpecific(LSLASTNode *node) override;
+    void beginDebugFunction();
     bool visit(LSLScript* script) override;
     bool visit(LSLGlobalVariable* glob_var) override;
     bool visit(LSLState* state) override;
@@ -138,11 +147,24 @@ public:
     // current max stack size in the function
     unsigned int mStackSize;
     int16_t mTargetReg;
+    bool mDebugLines = false;
+    // line of the node being compiled, 0 before the first node with one
+    int mDebugLine = 0;
 };
 
 }
 
-void compileLSLOrThrow(Luau::BytecodeBuilder &bcb, const std::string &source);
-std::string compileLSL(const std::string &source);
+// What the compiler learned about a script beyond its bytecode
+struct LSLScriptInfo {
+    // One mask per state, indexed by state number. Bit (index - 1) is set for
+    // each event the state handles, index being the event's 1-based position
+    // in builtins.txt, which Tailslide records on the event symbol.
+    std::vector<uint64_t> stateHandlerMasks;
+};
+
+void compileLSLOrThrow(Luau::BytecodeBuilder &bcb, const std::string &source, LSLScriptInfo *info = nullptr, bool debugLines = false);
+std::string compileLSL(const std::string &source, LSLScriptInfo *info = nullptr, bool debugLines = false);
+
+std::string compileLSLAssetOrThrow(const std::string &source, uint32_t apiVersion = 0, bool debugLines = false);
 
 #endif // LUAU_LSLCOMPILER_H

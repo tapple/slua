@@ -17,11 +17,9 @@
 #include <unordered_set>
 
 LUAU_FASTINTVARIABLE(LuauIndentTypeMismatchMaxTypeLength, 10)
-
-LUAU_FASTFLAGVARIABLE(LuauNewNonStrictReportsOneIndexedErrors)
-LUAU_FASTFLAG(LuauSubtypingReportGenericBoundMismatches2)
-LUAU_FASTFLAG(LuauUnknownGlobalFixSuggestion)
-LUAU_FASTFLAGVARIABLE(LuauNewNonStrictBetterCheckedFunctionErrorMessage)
+LUAU_FASTINTVARIABLE(LuauCyclicSccWarningDisplayLimit, 10)
+LUAU_FASTFLAG(LuauCyclicRequireTypeInference)
+LUAU_FASTFLAG(DebugLuauUserDefinedClasses)
 
 static std::string wrongNumberOfArgsString(
     size_t expectedCount,
@@ -118,9 +116,23 @@ struct ErrorConverter
             std::string given = givenModule ? quote(givenType) + " from " + quote(*givenModule) : quote(givenType);
             std::string wanted = wantedModule ? quote(wantedType) + " from " + quote(*wantedModule) : quote(wantedType);
             size_t luauIndentTypeMismatchMaxTypeLength = size_t(FInt::LuauIndentTypeMismatchMaxTypeLength);
+            if (get<NeverType>(follow(tm.wantedType)))
+            {
+                if (givenType.length() <= luauIndentTypeMismatchMaxTypeLength)
+                    return "Expected this to be unreachable, but got " + given;
+                return "Expected this to be unreachable, but got\n\t" + given;
+            }
+
+            if (tm.context == TypeMismatch::InvariantContext)
+            {
+                if (givenType.length() <= luauIndentTypeMismatchMaxTypeLength || wantedType.length() <= luauIndentTypeMismatchMaxTypeLength)
+                    return "Expected this to be exactly " + wanted + ", but got " + given;
+                return "Expected this to be exactly\n\t" + wanted + "\nbut got\n\t" + given;
+            }
+
             if (givenType.length() <= luauIndentTypeMismatchMaxTypeLength || wantedType.length() <= luauIndentTypeMismatchMaxTypeLength)
-                return "Type " + given + " could not be converted into " + wanted;
-            return "Type\n\t" + given + "\ncould not be converted into\n\t" + wanted;
+                return "Expected this to be " + wanted + ", but got " + given;
+            return "Expected this to be\n\t" + wanted + "\nbut got\n\t" + given;
         };
 
         if (givenTypeName == wantedTypeName)
@@ -160,10 +172,6 @@ struct ErrorConverter
         {
             result += "; " + tm.reason;
         }
-        else if (tm.context == TypeMismatch::InvariantContext)
-        {
-            result += " in an invariant context";
-        }
 
         return result;
     }
@@ -173,8 +181,7 @@ struct ErrorConverter
         switch (e.context)
         {
         case UnknownSymbol::Binding:
-            return FFlag::LuauUnknownGlobalFixSuggestion ? "Unknown global '" + e.name + "'; consider assigning to it first"
-                                                         : "Unknown global '" + e.name + "'";
+            return "Unknown global '" + e.name + "'; consider assigning to it first";
         case UnknownSymbol::Type:
             return "Unknown type '" + e.name + "'";
         }
@@ -189,7 +196,7 @@ struct ErrorConverter
         if (get<TableType>(t))
             return "Key '" + e.key + "' not found in table '" + Luau::toString(t) + "'";
         else if (get<ExternType>(t))
-            return "Key '" + e.key + "' not found in class '" + Luau::toString(t) + "'";
+            return "Key '" + e.key + "' not found in external type '" + Luau::toString(t) + "'";
         else
             return "Type '" + Luau::toString(e.table) + "' does not have key '" + e.key + "'";
     }
@@ -236,7 +243,6 @@ struct ErrorConverter
     std::string operator()(const Luau::CountMismatch& e) const
     {
         const std::string expectedS = e.expected == 1 ? "" : "s";
-        const std::string actualS = e.actual == 1 ? "" : "s";
         const std::string actualVerb = e.actual == 1 ? "is" : "are";
 
         switch (e.context)
@@ -362,7 +368,7 @@ struct ErrorConverter
 
         TypeId t = follow(e.table);
         if (get<ExternType>(t))
-            s += "class";
+            s += "external type";
         else
             s += "table";
 
@@ -458,26 +464,61 @@ struct ErrorConverter
 
     std::string operator()(const Luau::ModuleHasCyclicDependency& e) const
     {
-        if (e.cycle.empty())
-            return "Cyclic module dependency detected";
-
-        std::string s = "Cyclic module dependency: ";
-
-        bool first = true;
-        for (const ModuleName& name : e.cycle)
+        if (FFlag::LuauCyclicRequireTypeInference)
         {
-            if (first)
-                first = false;
-            else
-                s += " -> ";
+            if (e.cycle.empty())
+                return "Cyclic dependencies are only supported if all modules in the cycle use 'export' syntax";
 
-            if (fileResolver != nullptr)
-                s += fileResolver->getHumanReadableModuleName(name);
-            else
-                s += name;
+            std::string s =
+                "Cyclic dependencies are only supported if all modules in the cycle use 'export' syntax. The following modules do not use 'export': ";
+
+            bool first = true;
+            for (const ModuleName& name : e.cycle)
+            {
+                if (first)
+                    first = false;
+                else
+                    s += ", ";
+
+                if (fileResolver != nullptr)
+                    s += fileResolver->getHumanReadableModuleName(name);
+                else
+                    s += name;
+            }
+
+            return s;
         }
+        else
+        {
+            if (e.cycle.empty())
+                return "Cyclic module dependency detected";
 
-        return s;
+            std::string s = "Cyclic module dependency: ";
+
+            bool first = true;
+            for (const ModuleName& name : e.cycle)
+            {
+                if (first)
+                    first = false;
+                else
+                    s += " -> ";
+
+                if (fileResolver != nullptr)
+                    s += fileResolver->getHumanReadableModuleName(name);
+                else
+                    s += name;
+            }
+
+            return s;
+        }
+    }
+
+    std::string operator()(const Luau::CyclicModuleTopLevelAccess& e) const
+    {
+        std::string moduleName = fileResolver ? fileResolver->getHumanReadableModuleName(e.cyclicModuleName) : e.cyclicModuleName;
+        std::string access = e.propName.empty() ? e.localName : (e.localName + "." + e.propName);
+        return "Top-level access '" + access + "' from cyclically required module '" + moduleName +
+               "' may fail at runtime depending on module initialization order; try moving this access into a function body";
     }
 
     std::string operator()(const Luau::FunctionExitsWithoutReturning& e) const
@@ -598,7 +639,7 @@ struct ErrorConverter
 
     std::string operator()(const TypePackMismatch& e) const
     {
-        std::string ss = "Type pack '" + toString(e.givenTp) + "' could not be converted into '" + toString(e.wantedTp) + "'";
+        std::string ss = "Expected this to be '" + toString(e.wantedTp) + "', but got '" + toString(e.givenTp) + "'";
 
         if (!e.reason.empty())
             ss += "; " + e.reason;
@@ -759,49 +800,27 @@ struct ErrorConverter
 
     std::string operator()(const CheckedFunctionCallError& e) const
     {
-        if (FFlag::LuauNewNonStrictBetterCheckedFunctionErrorMessage)
-        {
-            return "the function '" + e.checkedFunctionName + "' expects to get a " + toString(e.expected) + " as its " +
-                   toHumanReadableIndex(e.argumentIndex) + " argument, but is being given a " + toString(e.passed) + "";
-        }
-        else
-        {
-            // TODO: What happens if checkedFunctionName cannot be found??
-            return "Function '" + e.checkedFunctionName + "' expects '" + toString(e.expected) + "' at argument #" +
-                   std::to_string(e.argumentIndex + 1) + ", but got '" + Luau::toString(e.passed) + "'";
-        }
+        return "the function '" + e.checkedFunctionName + "' expects to get a " + toString(e.expected) + " as its " +
+               toHumanReadableIndex(e.argumentIndex) + " argument, but is being given a " + toString(e.passed) + "";
     }
 
     std::string operator()(const NonStrictFunctionDefinitionError& e) const
     {
-        if (FFlag::LuauNewNonStrictBetterCheckedFunctionErrorMessage)
-        {
-            std::string prefix = e.functionName.empty() ? "" : "in the function '" + e.functionName + "', '";
-            return prefix + "the argument '" + e.argument + "' is used in a way that will error at runtime";
-        }
-        else
-        {
-            if (e.functionName.empty())
-            {
-                return "Argument " + e.argument + " with type '" + toString(e.argumentType) + "' is used in a way that will run time error";
-            }
-            else
-            {
-                return "Argument " + e.argument + " with type '" + toString(e.argumentType) + "' in function '" + e.functionName +
-                       "' is used in a way that will run time error";
-            }
-        }
+        std::string prefix = e.functionName.empty() ? "" : "in the function '" + e.functionName + "', '";
+        return prefix + "the argument '" + e.argument + "' is used in a way that will error at runtime";
     }
 
     std::string operator()(const PropertyAccessViolation& e) const
     {
         const std::string stringKey = isIdentifier(e.key) ? e.key : "\"" + e.key + "\"";
+        const std::string kind = getTableType(e.table) ? "table" : "type";
+
         switch (e.context)
         {
         case PropertyAccessViolation::CannotRead:
-            return "Property " + stringKey + " of table '" + toString(e.table) + "' is write-only";
+            return "Property " + stringKey + " of " + kind + " '" + toString(e.table) + "' is write-only";
         case PropertyAccessViolation::CannotWrite:
-            return "Property " + stringKey + " of table '" + toString(e.table) + "' is read-only";
+            return "Property " + stringKey + " of " + kind + " '" + toString(e.table) + "' is read-only";
         }
 
         LUAU_UNREACHABLE();
@@ -811,16 +830,8 @@ struct ErrorConverter
     std::string operator()(const CheckedFunctionIncorrectArgs& e) const
     {
 
-        if (FFlag::LuauNewNonStrictBetterCheckedFunctionErrorMessage)
-        {
-            return "the function '" + e.functionName + "' will error at runtime if it is not called with " + std::to_string(e.expected) +
-                   " arguments, but we are calling it here with " + std::to_string(e.actual) + " arguments";
-        }
-        else
-        {
-            return "Checked Function " + e.functionName + " expects " + std::to_string(e.expected) + " arguments, but received " +
-                   std::to_string(e.actual);
-        }
+        return "the function '" + e.functionName + "' will error at runtime if it is not called with " + std::to_string(e.expected) +
+               " arguments, but we are calling it here with " + std::to_string(e.actual) + " arguments";
     }
 
     std::string operator()(const UnexpectedTypeInSubtyping& e) const
@@ -836,6 +847,11 @@ struct ErrorConverter
     std::string operator()(const UserDefinedTypeFunctionError& e) const
     {
         return e.message;
+    }
+
+    std::string operator()(const BuiltInTypeFunctionError& e) const
+    {
+        return toString(e.error);
     }
 
     std::string operator()(const ReservedIdentifier& e) const
@@ -898,7 +914,6 @@ struct ErrorConverter
 
     std::string operator()(const GenericBoundsMismatch& e) const
     {
-        LUAU_ASSERT(FFlag::LuauSubtypingReportGenericBoundMismatches2);
         std::string lowerBounds;
         for (size_t i = 0; i < e.lowerBounds.size(); ++i)
         {
@@ -1000,6 +1015,88 @@ struct ErrorConverter
     std::string operator()(const UnappliedTypeFunction&) const
     {
         return "Type functions always require `<>` when referenced.";
+    }
+
+    std::string operator()(const AmbiguousFunctionCall& afc) const
+    {
+        return "Calling function " + toString(afc.function) + " with argument pack " + toString(afc.arguments) + " is ambiguous.";
+    }
+
+    std::string operator()(const UninitializedFieldAccess& afc) const
+    {
+        LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses);
+
+        if (afc.fieldName)
+            return "Access to field '" + *afc.fieldName + "' of self before it has been initialized";
+        else
+            return "Access to 'self' before all of its fields have been initialized";
+    }
+
+    std::string operator()(const TypeAnnotationRequired& err) const
+    {
+        ToStringOptions opts;
+        opts.functionTypeArguments = true;
+        opts.ignoreSyntheticName = true;
+        auto tos = toStringDetailed(err.inferredTy, opts);
+        if (!tos.invalid && !tos.truncated && !tos.error)
+            return "Type annotation required here.  Consider " + tos.name;
+        else
+            return "Type annotation required here.  Unable to infer the type of this function.";
+    }
+
+    std::string operator()(const ConstructorsShouldNotReturnAnything&) const
+    {
+        return "Class constructors should not return anything.";
+    }
+
+    std::string operator()(const CyclicClassInheritance& e) const
+    {
+        std::string s = "Cyclic class inheritance detected: ";
+        bool first = true;
+        for (const Name& name : e.cycle)
+        {
+            if (first)
+                first = false;
+            else
+                s += " -> ";
+            s += name;
+        }
+        return s;
+    }
+
+    std::string operator()(const InvalidClassExtension& e) const
+    {
+        switch (e.context)
+        {
+        case InvalidClassExtension::ClassIsNotOpen:
+            return "Non-open class " + toString(e.baseClass) + " cannot be extended";
+        case InvalidClassExtension::BaseIsClassInstance:
+            return "Object of type " + toString(e.baseClass) + " cannot be extended because it is an object, not a class";
+        case InvalidClassExtension::NotAClass:
+            return "Cannot extend non-class of type " + toString(e.baseClass);
+        default:
+            LUAU_ASSERT(0);
+            return "Cannot extend non-class of type " + toString(e.baseClass);
+        }
+    }
+
+    std::string operator()(const IncompatibleClassMethodOverride& e) const
+    {
+        if (e.method == "__eq" || e.method == "__lt" || e.method == "__le")
+        {
+            return "Illegal override of comparison metamethod '" + e.method + "' on class '" + e.className + "' inherited from superclass '" +
+                   e.superName + "'";
+        }
+        else
+        {
+            return "Method '" + e.method + "' on class '" + e.className + "' is not a compatible override of the method inherited from superclass '" +
+                   e.superName + "'";
+        }
+    }
+
+    std::string operator()(const IllegalClassPropertyOverride& e) const
+    {
+        return "Illegal override of property '" + e.property + "' on class '" + e.className + "' inherited from superclass '" + e.superName + "'";
     }
 };
 
@@ -1233,6 +1330,26 @@ bool FunctionExitsWithoutReturning::operator==(const FunctionExitsWithoutReturni
     return expectedReturnType == rhs.expectedReturnType;
 }
 
+bool CyclicClassInheritance::operator==(const CyclicClassInheritance& rhs) const
+{
+    return cycle.size() == rhs.cycle.size() && std::equal(cycle.begin(), cycle.end(), rhs.cycle.begin());
+}
+
+bool InvalidClassExtension::operator==(const InvalidClassExtension& rhs) const
+{
+    return context == rhs.context && baseClass == rhs.baseClass;
+}
+
+bool IncompatibleClassMethodOverride::operator==(const IncompatibleClassMethodOverride& rhs) const
+{
+    return method == rhs.method && className == rhs.className && superName == rhs.superName;
+}
+
+bool IllegalClassPropertyOverride::operator==(const IllegalClassPropertyOverride& rhs) const
+{
+    return property == rhs.property && className == rhs.className && superName == rhs.superName;
+}
+
 int TypeError::code() const
 {
     return minCode() + int(data.index());
@@ -1256,6 +1373,11 @@ bool TypeError::operator==(const TypeError& rhs) const
 bool ModuleHasCyclicDependency::operator==(const ModuleHasCyclicDependency& rhs) const
 {
     return cycle.size() == rhs.cycle.size() && std::equal(cycle.begin(), cycle.end(), rhs.cycle.begin());
+}
+
+bool CyclicModuleTopLevelAccess::operator==(const CyclicModuleTopLevelAccess& rhs) const
+{
+    return cyclicModuleName == rhs.cyclicModuleName && localName == rhs.localName && propName == rhs.propName;
 }
 
 bool IllegalRequire::operator==(const IllegalRequire& rhs) const
@@ -1375,6 +1497,11 @@ bool UserDefinedTypeFunctionError::operator==(const UserDefinedTypeFunctionError
     return message == rhs.message;
 }
 
+bool BuiltInTypeFunctionError::operator==(const BuiltInTypeFunctionError& rhs) const
+{
+    return error == rhs.error;
+}
+
 bool ReservedIdentifier::operator==(const ReservedIdentifier& rhs) const
 {
     return name == rhs.name;
@@ -1420,23 +1547,37 @@ bool TypeInstantiationCountMismatch::operator==(const TypeInstantiationCountMism
            maximumTypes == rhs.maximumTypes && providedTypePacks == rhs.providedTypePacks && maximumTypePacks == rhs.maximumTypePacks;
 }
 
-GenericBoundsMismatch::GenericBoundsMismatch(const std::string_view genericName, TypeIds lowerBoundSet, TypeIds upperBoundSet)
-    : genericName(genericName)
+GenericBoundsMismatch::GenericBoundsMismatch(std::string genericName, TypeIds lowerBoundSet, TypeIds upperBoundSet)
+    : genericName(std::move(genericName))
     , lowerBounds(lowerBoundSet.take())
     , upperBounds(upperBoundSet.take())
 {
-    LUAU_ASSERT(FFlag::LuauSubtypingReportGenericBoundMismatches2);
 }
 
 bool GenericBoundsMismatch::operator==(const GenericBoundsMismatch& rhs) const
 {
-    LUAU_ASSERT(FFlag::LuauSubtypingReportGenericBoundMismatches2);
     return genericName == rhs.genericName && lowerBounds == rhs.lowerBounds && upperBounds == rhs.upperBounds;
 }
 
 bool UnappliedTypeFunction::operator==(const UnappliedTypeFunction& rhs) const
 {
     return true;
+}
+
+bool AmbiguousFunctionCall::operator==(const AmbiguousFunctionCall& rhs) const
+{
+    return function == rhs.function && arguments == rhs.arguments;
+}
+
+bool TypeAnnotationRequired::operator==(const TypeAnnotationRequired& rhs) const
+{
+    return inferredTy == rhs.inferredTy;
+}
+
+bool UninitializedFieldAccess::operator==(const UninitializedFieldAccess& rhs) const
+{
+    LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses);
+    return fieldName == rhs.fieldName;
 }
 
 std::string toString(const TypeError& error)
@@ -1560,6 +1701,9 @@ void copyError(T& e, TypeArena& destArena, CloneState& cloneState)
     else if constexpr (std::is_same_v<T, ModuleHasCyclicDependency>)
     {
     }
+    else if constexpr (std::is_same_v<T, CyclicModuleTopLevelAccess>)
+    {
+    }
     else if constexpr (std::is_same_v<T, IllegalRequire>)
     {
     }
@@ -1642,6 +1786,9 @@ void copyError(T& e, TypeArena& destArena, CloneState& cloneState)
     else if constexpr (std::is_same_v<T, UserDefinedTypeFunctionError>)
     {
     }
+    else if constexpr (std::is_same_v<T, BuiltInTypeFunctionError>)
+    {
+    }
     else if constexpr (std::is_same_v<T, CannotAssignToNever>)
     {
         e.rhsType = clone(e.rhsType);
@@ -1672,7 +1819,6 @@ void copyError(T& e, TypeArena& destArena, CloneState& cloneState)
     }
     else if constexpr (std::is_same_v<T, GenericBoundsMismatch>)
     {
-        LUAU_ASSERT(FFlag::LuauSubtypingReportGenericBoundMismatches2);
         for (auto& lowerBound : e.lowerBounds)
             lowerBound = clone(lowerBound);
         for (auto& upperBound : e.upperBounds)
@@ -1686,6 +1832,34 @@ void copyError(T& e, TypeArena& destArena, CloneState& cloneState)
         e.functionType = clone(e.functionType);
     }
     else if constexpr (std::is_same_v<T, UnappliedTypeFunction>)
+    {
+    }
+    else if constexpr (std::is_same_v<T, AmbiguousFunctionCall>)
+    {
+        e.function = clone(e.function);
+        e.arguments = clone(e.arguments);
+    }
+    else if constexpr (std::is_same_v<T, UninitializedFieldAccess>)
+    {
+    }
+    else if constexpr (std::is_same_v<T, TypeAnnotationRequired>)
+    {
+        e.inferredTy = clone(e.inferredTy);
+    }
+    else if constexpr (std::is_same_v<T, ConstructorsShouldNotReturnAnything>)
+    {
+    }
+    else if constexpr (std::is_same_v<T, CyclicClassInheritance>)
+    {
+    }
+    else if constexpr (std::is_same_v<T, InvalidClassExtension>)
+    {
+        e.baseClass = clone(e.baseClass);
+    }
+    else if constexpr (std::is_same_v<T, IncompatibleClassMethodOverride>)
+    {
+    }
+    else if constexpr (std::is_same_v<T, IllegalClassPropertyOverride>)
     {
     }
     else

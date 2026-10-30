@@ -7,20 +7,31 @@
 struct lua_Page;
 union GCObject;
 
-#define luaM_newgco(L, t, size, memcat) cast_to(t*, luaM_newgco_(L, size, memcat))
+#define luaM_newgco(L, t, size, memcat, tt) cast_to(t*, luaM_newgco_(L, size, memcat, tt, 0))
+#define luaM_newgcoudata(L, t, size, memcat, tt, tag) cast_to(t*, luaM_newgco_(L, size, memcat, tt, tag))
+#define luaM_newgcofixed(L, t, size, memcat, tt) cast_to(t*, luaM_newgcofixed_(L, size, memcat, tt))
+#define luaM_newgcocaged(L, t, size, memcat, tt) cast_to(t*, luaM_newgcocaged_(L, size, memcat, tt, 0))
 #define luaM_freegco(L, p, size, memcat, page) luaM_freegco_(L, obj2gco(p), size, memcat, page)
+#define luaM_freegcofixed(L, p, size, memcat, page) luaM_freegcofixed_(L, obj2gco(p), size, memcat, page)
+#define luaM_freegcocaged(L, p, size, memcat, page) luaM_freegcocaged_(L, obj2gco(p), size, memcat, page)
 
 #define luaM_arraysize_(L, n, e) ((cast_to(size_t, (n)) <= SIZE_MAX / (e)) ? (n) * (e) : (luaM_toobig(L), SIZE_MAX))
 
 #define luaM_newarray(L, n, t, memcat) cast_to(t*, luaM_new_(L, luaM_arraysize_(L, n, sizeof(t)), memcat))
+#define luaM_trynewarray(L, n, t, memcat) cast_to(t*, luaM_trynew_(L, luaM_arraysize_(L, n, sizeof(t)), memcat))
 #define luaM_freearray(L, b, n, t, memcat) luaM_free_(L, (b), (n) * sizeof(t), memcat)
 #define luaM_reallocarray(L, v, oldn, n, t, memcat) \
     ((v) = cast_to(t*, luaM_realloc_(L, v, (oldn) * sizeof(t), luaM_arraysize_(L, n, sizeof(t)), memcat)))
 
 LUAI_FUNC void* luaM_new_(lua_State* L, size_t nsize, uint8_t memcat);
-LUAI_FUNC GCObject* luaM_newgco_(lua_State* L, size_t nsize, uint8_t memcat);
+LUAI_FUNC void* luaM_trynew_(lua_State* L, size_t nsize, uint8_t memcat);
+LUAI_FUNC GCObject* luaM_newgco_(lua_State* L, size_t nsize, uint8_t memcat, int tt, int tag);
+LUAI_FUNC GCObject* luaM_newgcofixed_(lua_State* L, size_t nsize, uint8_t memcat, int tt);
+LUAI_FUNC GCObject* luaM_newgcocaged_(lua_State* L, size_t nsize, uint8_t memcat, int tt, int tag);
 LUAI_FUNC void luaM_free_(lua_State* L, void* block, size_t osize, uint8_t memcat);
 LUAI_FUNC void luaM_freegco_(lua_State* L, GCObject* block, size_t osize, uint8_t memcat, lua_Page* page);
+LUAI_FUNC void luaM_freegcofixed_(lua_State* L, GCObject* block, size_t osize, uint8_t memcat, lua_Page* page);
+LUAI_FUNC void luaM_freegcocaged_(lua_State* L, GCObject* block, size_t osize, uint8_t memcat, lua_Page* page);
 LUAI_FUNC void* luaM_realloc_(lua_State* L, void* block, size_t osize, size_t nsize, uint8_t memcat);
 
 LUAI_FUNC l_noret luaM_toobig(lua_State* L);
@@ -32,17 +43,18 @@ LUAI_FUNC lua_Page* luaM_getnextpage(lua_Page* page);
 LUAI_FUNC void luaM_visitpage(lua_Page* page, void* context, bool (*visitor)(void* context, lua_Page* page, GCObject* gco));
 LUAI_FUNC void luaM_visitgco(lua_State* L, void* context, bool (*visitor)(void* context, lua_Page* page, GCObject* gco));
 
-// ServerLua: for user allocation tracking, basically used as a `defer` to clear out
-// `unrooteduserallocs` in case of exceptions.
+// ServerLua: for user allocation tracking. Links an object that's still being built, and isn't
+// reachable yet, into `unrootedallocs` so heap walks treat it as a root. Unlinks on scope exit,
+// including exceptions. Walks traverse the object, so its fields must be valid while tracked.
 struct global_State;
-class UnrootedAllocTracker
+struct UnrootedAllocTracker
 {
-public:
-    UnrootedAllocTracker(lua_State *L);
+    UnrootedAllocTracker(lua_State* L, GCObject* o);
     ~UnrootedAllocTracker();
-protected:
-    global_State *_mGlobalState;
+
+    global_State* g;
+    GCObject* obj;
+    UnrootedAllocTracker* prev;
 };
 
-#define LUAU_TRACK_UNROOTED_ALLOCS() [[maybe_unused]] UnrootedAllocTracker _tracker{L};
-#define LUAU_MAYBE_TRACK_UNROOTED(L, size) do { if ((L)->activememcat > 1) { L->global->unrooteduserallocs += (size); }} while (0);
+#define LUAU_TRACK_UNROOTED_ALLOCS(o) [[maybe_unused]] UnrootedAllocTracker _tracker{L, obj2gco(o)};

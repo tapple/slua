@@ -225,7 +225,47 @@ assert(not table.pack(pcall(function() ro_table['foo'] = 1 end))[1])
 local userdata = newproxy(true)
 assert(ares.unpersist(ares.persist(userdata)) ~= nil)
 
+-- A proxy's metatable is the script's, and can refer back to it
+getmetatable(userdata).self = userdata
+local proxy_copy = round_trip(userdata)
+assert(getmetatable(proxy_copy).self == proxy_copy)
+
 assert_round_trips(vector(1, 2, 3))
+
+-- Strings live in a table ahead of the root, so a repeat costs an index, not a copy
+local long_str = string.rep("abcdefgh", 64)
+local once = #ares.persist({long_str})
+local four_times = #ares.persist({long_str, long_str, long_str, long_str})
+assert(four_times - once < #long_str)
+
+-- The same string as key and value resolves to the same table entry
+local str_key_val = round_trip({[long_str] = long_str, other = "other"})
+assert(str_key_val[long_str] == long_str)
+assert(str_key_val.other == "other")
+
+-- Integer values survive round-trips at full 64-bit width.
+-- The integer library is only registered when the integer fflags are enabled,
+-- and this file must still parse without them, so no integer literals here.
+if integer ~= nil then
+    local int_vals = {
+        integer.create(0),
+        integer.create(1),
+        integer.minsigned,
+        integer.maxsigned,
+        integer.sub(integer.maxsigned, integer.create(1)),
+    }
+    for _, v in int_vals do
+        local rt = round_trip(v)
+        assert(type(rt) == "integer")
+        assert(rt == v)
+    end
+
+    -- as table values and keys, too
+    local int_tab = round_trip({integer.create(1), key = integer.create(2^40), [integer.create(3)] = "three"})
+    assert(int_tab[1] == integer.create(1))
+    assert(int_tab.key == integer.create(2^40))
+    assert(int_tab[integer.create(3)] == "three")
+end
 
 print('OK')
 return 'OK'

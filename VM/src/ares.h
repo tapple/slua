@@ -39,36 +39,7 @@ THE SOFTWARE.
 */
 
 /**
- * This provides an interface to Eris' persist functionality for writing in
- * an arbitrary way, using a writer.
- *
- * When called, the stack in 'L' must look like this:
- * 1: perms:table
- * 2: value:any
- *
- * 'writer' is the writer stream used to store all data.
- *
- * [-0, +0, e]
- */
-LUA_API void eris_dump(lua_State* L, std::ostream *writer);
-
-/**
- * This provides an interface to Eris' unpersist functionality for reading
- * in an arbitrary way, using a reader.
- *
- * When called, the stack in 'L' must look like this:
- * 1: perms:table
- *
- * 'reader' is the reader stream used to read all data
- *
- * The result of the operation will be pushed onto the stack.
- *
- * [-0, +1, e]
- */
-LUA_API void eris_undump(lua_State* L, std::istream *reader);
-
-/**
- * This is a stack-based alternative to eris_dump.
+ * Persists a value to a string on the stack.
  *
  * It expects the perms table at the specified index 'perms' and the value to
  * persist at the specified index 'value'. It will push the resulting string
@@ -79,15 +50,18 @@ LUA_API void eris_undump(lua_State* L, std::istream *reader);
 LUA_API int eris_persist(lua_State* L, int perms, int value);
 
 /**
- * This is a stack-based alternative to eris_undump.
+ * Unpersists a value from a string on the stack.
  *
  * It expects the perms table at the specified index 'perms' and the string
  * containing persisted data at the specified index 'value'. It will push the
  * resulting value onto the stack on success.
  *
+ * `threaddata`, when set, is stamped as the threaddata of every thread
+ * created while unpersisting.
+ *
  * [-0, +1, e]
  */
-LUA_API int eris_unpersist(lua_State* L, int perms, int value);
+LUA_API int eris_unpersist(lua_State* L, int perms, int value, void *threaddata = nullptr);
 
 /**
  * Pushes the current value of a setting onto the stack.
@@ -108,6 +82,9 @@ LUA_API int eris_unpersist(lua_State* L, int perms, int value);
  *            unpersisting it will pass along a ZIO*.
  * - 'spkey'  the name of the field in the metatable of tables and userdata
  *            used to control persistence (on/off or special persistence).
+ * - 'strict' whether to refuse values a production script state never holds,
+ *            on both persist and unpersist: protos by value, untagged
+ *            lightuserdata and test-only userdata.
  *
  * If an unknown name is specified this will throw an error.
  *
@@ -129,7 +106,7 @@ LUA_API void eris_set_setting(lua_State *L, const char *name, int value);
 
 LUA_API lua_State *eris_make_forkserver(lua_State *Lsrc);
 
-LUA_API lua_State *eris_fork_thread(lua_State *Lforker, uint8_t default_state, uint8_t memcat);
+LUA_API lua_State *eris_fork_thread(lua_State *Lforker, uint8_t default_state, uint8_t memcat, void *threaddata);
 LUA_API int eris_serialize_thread(lua_State *Lforker, lua_State *L);
 LUA_API void eris_set_compile_func(void (*compile_func)(lua_State*, int));
 

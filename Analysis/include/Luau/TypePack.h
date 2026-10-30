@@ -47,6 +47,8 @@ struct GenericTypePack
     explicit GenericTypePack(Scope* scope, Polarity polarity = Polarity::Unknown);
     GenericTypePack(TypeLevel level, const Name& name);
     GenericTypePack(Scope* scope, const Name& name);
+    GenericTypePack(Scope* scope, Name name, Polarity polarity);
+    explicit GenericTypePack(Polarity polarity);
 
     int index;
     TypeLevel level;
@@ -116,7 +118,7 @@ struct TypePackVar
 
     TypePackVar& operator=(const TypePackVar& rhs);
 
-    // Re-assignes the content of the pack, but doesn't change the owning arena and can't make pack persistent.
+    // Re-assigns the content of the pack, but doesn't change the owning arena and can't make pack persistent.
     void reassign(const TypePackVar& rhs)
     {
         ty = rhs.ty;
@@ -155,8 +157,8 @@ struct TypePackIterator
     using iterator_category = std::input_iterator_tag;
 
     TypePackIterator() = default;
-    explicit TypePackIterator(TypePackId tp);
-    TypePackIterator(TypePackId tp, const TxnLog* log);
+    explicit TypePackIterator(TypePackId typePack);
+    TypePackIterator(TypePackId typePack, const TxnLog* log);
 
     TypePackIterator& operator++();
     TypePackIterator operator++(int);
@@ -164,6 +166,10 @@ struct TypePackIterator
     bool operator==(const TypePackIterator& rhs);
 
     const TypeId& operator*();
+
+    // If the iterator currently points at the head of a type pack, return that
+    // pack.  Else return nullopt.
+    std::optional<TypePackId> tryGetHead() const;
 
     /** Return the tail of a TypePack.
      * This may *only* be called on an iterator that has been incremented to the end.
@@ -188,10 +194,6 @@ TypePackIterator end(TypePackId tp);
 
 TypePackId getTail(TypePackId tp);
 
-using SeenSet = std::set<std::pair<const void*, const void*>>;
-
-bool areEqual(SeenSet& seen, const TypePackVar& lhs, const TypePackVar& rhs);
-
 TypePackId follow(TypePackId tp);
 TypePackId follow(TypePackId t, const void* context, TypePackId (*mapper)(const void*, TypePackId));
 
@@ -199,6 +201,8 @@ size_t size(TypePackId tp, TxnLog* log = nullptr);
 bool finite(TypePackId tp, TxnLog* log = nullptr);
 size_t size(const TypePack& tp, TxnLog* log = nullptr);
 std::optional<TypeId> first(TypePackId tp, bool ignoreHiddenVariadics = true);
+
+TypePackId typePackFromIterator(NotNull<TypeArena> arena, TypePackIterator startIter, TypePackIterator endIter);
 
 TypePackVar* asMutable(TypePackId tp);
 TypePack* asMutable(const TypePack* tp);
@@ -232,7 +236,7 @@ bool isEmpty(TypePackId tp);
 std::pair<std::vector<TypeId>, std::optional<TypePackId>> flatten(TypePackId tp);
 std::pair<std::vector<TypeId>, std::optional<TypePackId>> flatten(TypePackId tp, const TxnLog& log);
 
-/// Returs true if the type pack arose from a function that is declared to be variadic.
+/// Returns true if the type pack arose from a function that is declared to be variadic.
 /// Returns *false* for function argument packs that are inferred to be safe to oversaturate!
 bool isVariadic(TypePackId tp);
 bool isVariadic(TypePackId tp, const TxnLog& log);

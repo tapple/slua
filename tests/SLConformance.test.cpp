@@ -3,6 +3,7 @@
 #include "lualib.h"
 #include "luacode.h"
 #include "luacodegen.h"
+#include "llruleset_builder.h"
 
 #include "Luau/BuiltinDefinitions.h"
 #include "Luau/DenseHash.h"
@@ -15,8 +16,10 @@
 #include "Luau/BytecodeSummary.h"
 
 #include "doctest.h"
+#include "Luau/LSLBuiltins.h"
 #include "ScopedFlags.h"
 #include "llsl.h"
+#include "lyieldablemacros.h"
 #include "../VM/src/lstate.h"
 #include "../VM/src/mono_strings.h"
 #include "../VM/src/lapi.h"
@@ -24,6 +27,7 @@
 #include "../VM/src/ltable.h"
 
 #include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 #include <math.h>
@@ -35,6 +39,8 @@ extern int optimizationLevel;
 LUAU_FASTINT(CodegenHeuristicsInstructionLimit)
 LUAU_DYNAMIC_FASTFLAG(LuauCodegenTrackingMultilocationFix)
 LUAU_FASTFLAG(LuauCodegenDetailedCompilationResult)
+LUAU_FASTFLAG(SLuaEagerWeakClear)
+LUAU_FASTFLAG(LuauCoroutineFinally)
 
 
 using StateRef = std::unique_ptr<lua_State, void (*)(lua_State*)>;
@@ -151,14 +157,6 @@ static int lua_collectgarbage(lua_State* L)
     }
 }
 
-static int test_integer_call(lua_State *L)
-{
-    luaL_checkany(L, 1);
-    lua_settop(L, 1);
-    lua_pushunsigned(L, (unsigned int)LSLIType::LST_INTEGER);
-    return lsl_cast(L);
-}
-
 // Returns (array_size, hash_size) for a table - for testing table sizing behavior
 static int lua_table_sizes(lua_State* L)
 {
@@ -176,6 +174,10 @@ static int memoryLimitCallback(lua_State *L, size_t osize, size_t nsize)
     L = lua_mainthread(L);
     RuntimeState* state = (RuntimeState*)L->userdata;
 
+    // Bail if GC is disabled (host bulk work like luau_load)
+    if (L->global->GCthreshold == SIZE_MAX)
+        return 0;
+
     // This is a net shrink in memory, not relevant for our limiting logic. We can't assume that
     // memory being freed has anything to do with us, given that the GC can work on things unrelated
     // to the currently executing task.
@@ -188,7 +190,7 @@ static int memoryLimitCallback(lua_State *L, size_t osize, size_t nsize)
     // or the alloc would push us over the limit given the current approximate size.
     if (state->actual_size == 0 || (state->approximate_size + net_gain > state->max_mem))
     {
-        state->approximate_size = state->actual_size = lua_userthreadsize(L, &state->free_objects);
+        state->approximate_size = state->actual_size = lua_userthreadgc(L, &state->free_objects);
 
         if (state->actual_size + net_gain > state->max_mem)
             return 1;
@@ -200,8 +202,12 @@ static int memoryLimitCallback(lua_State *L, size_t osize, size_t nsize)
 }
 
 static StateRef runConformance(const char* name, void (*yield)(lua_State* L) = nullptr, void (*setup)(lua_State* L) = nullptr,
-    lua_State* initialLuaState = nullptr, lua_CompileOptions* options = nullptr)
+    lua_State* initialLuaState = nullptr, lua_CompileOptions* options = nullptr, bool setupConstants = true)
 {
+    ScopedSLuaFlags sluaFlags;
+
+    luauSL_init_global_builtins(nullptr);
+
     std::string path = getSourceFilePath(name);
     std::fstream stream(path, std::ios::in | std::ios::binary);
     INFO(path);
@@ -231,10 +237,12 @@ static StateRef runConformance(const char* name, void (*yield)(lua_State* L) = n
     luaopen_llbase64(GL);
     lua_pop(GL, 1);
 
+    if (setupConstants)
+        luaSL_set_constant_globals(GL);
+
     // Register a few global functions for conformance tests
     std::vector<luaL_Reg> funcs = {
         {"collectgarbage", lua_collectgarbage},
-        {"integer", test_integer_call},
     };
 
     // "null" terminate the list of functions to register
@@ -285,7 +293,7 @@ static StateRef runConformance(const char* name, void (*yield)(lua_State* L) = n
     compileOrThrow(bcb, source);
     std::string bytecode = bcb.getBytecode();
 
-    lua_setmemcat(L, 2);
+    lua_setmemcat(L, LUA_FIRST_USER_MEMCAT);
     int result = luau_load(L, chunkname.c_str(), bytecode.c_str(), bytecode.length(), 0);
     if (result)
     {
@@ -303,7 +311,7 @@ static StateRef runConformance(const char* name, void (*yield)(lua_State* L) = n
     lua_pop(GL, 1);
 
     // Ensure closures created during execution have correct memcat
-    lua_setmemcat(L, 2);
+    lua_setmemcat(L, LUA_FIRST_USER_MEMCAT);
 
     int status;
     do
@@ -391,9 +399,9 @@ REQUIRE_EQ(get_num_table_keys(L, (start_idx) + 1), (num_compressed)); \
 // Helper function to create a weak table
 // mode: "k" for weak keys, "v" for weak values, "kv" for both
 // Returns the stack index of the created table
-static int create_weak_table(lua_State *L, const char* mode)
+static int create_weak_table(lua_State *L, const char* mode, int narr = 0)
 {
-    lua_newtable(L);
+    lua_createtable(L, narr, 0);
     int table_idx = lua_gettop(L);
 
     // Create weak metatable
@@ -407,8 +415,9 @@ static int create_weak_table(lua_State *L, const char* mode)
 
 TEST_CASE("UUID interning")
 {
-    // Do nothing, just set up the state so we can poke it directly
-    auto state = runConformance("nothing.lua");
+    // Do nothing, just set up the state so we can poke it directly.
+    // Skip LSL constant globals so the UUID weak tables start empty.
+    auto state = runConformance("nothing.lua", nullptr, nullptr, nullptr, nullptr, false);
     lua_State *L = lua_tothread(state.get(), 1);
     REQUIRE(L);
     lua_gc(L, LUA_GCCOLLECT, 0);
@@ -420,19 +429,38 @@ TEST_CASE("UUID interning")
     lua_getref(L, runtime_state->uuidCompressedWeakTab);
     require_weak_uuid_counts(L, weak_idx, 0, 0);
 
+    // In SLua mode, pushing an invalid UUID string should return nil
+    luaSL_pushuuidstring(L, "foo");
+    REQUIRE(lua_isnil(L, -1));
+    lua_pop(L, 1);
+    require_weak_uuid_counts(L, weak_idx, 0, 0);
+
+    // In SLua mode, empty string normalizes to compressed NULL_KEY.
+    // Test interning: push twice, verify same interned object.
     for (int i=0; i<2; ++i)
     {
-        luaSL_pushuuidstring(L, "foo");
+        luaSL_pushuuidstring(L, "");
     }
 
     // These should have the same pointer identity
     REQUIRE_EQ(luaA_toobject(L, -1)->value.gc, luaA_toobject(L, -2)->value.gc);
 
-    require_weak_uuid_counts(L, weak_idx, 1, 0);
+    // Should be compressed (normalized to NULL_KEY)
+    lua_LSLUUID *empty_uuid = (lua_LSLUUID*)lua_touserdatatagged(L, -1, UTAG_UUID);
+    REQUIRE(empty_uuid != nullptr);
+    REQUIRE(empty_uuid->compressed);
+
+    // Should be the same interned object as pushing null bytes directly
+    static const uint8_t null_bytes[16] = {0};
+    luaSL_pushuuidbytes(L, null_bytes);
+    REQUIRE_EQ(luaA_toobject(L, -1)->value.gc, luaA_toobject(L, -2)->value.gc);
+    lua_pop(L, 1); // pop the bytes-pushed copy
+
+    require_weak_uuid_counts(L, weak_idx, 0, 1);
     // Pop off the newest copy, run a GC and then check that this assertion still holds.
     lua_pop(L, 1);
     lua_gc(L, LUA_GCCOLLECT, 0);
-    require_weak_uuid_counts(L, weak_idx, 1, 0);
+    require_weak_uuid_counts(L, weak_idx, 0, 1);
 
     // It's okay to release it once there are no more reachable instances
     lua_pop(L, 1);
@@ -459,18 +487,14 @@ TEST_CASE("UUID interning")
     lua_gc(L, LUA_GCCOLLECT, 0);
     require_weak_uuid_counts(L, weak_idx, 0, 0);
 
-    // Push a UUID as well as its binary form. These should result in separate instances
-    // even though they have the same underlying string value. one is compressed and
-    // one is not, but has the same literal bytes as the backing str.
+    // Push a UUID from string and from bytes. In SLua mode, both are compressed
+    // and should be interned to the same object.
     luaSL_pushuuidstring(L, "12345678-9abc-def0-1234-56789abcdef0");
-    luaSL_pushuuidlstring(L, "\x12\x34\x56\x78\x9a\xbc\xde\xf0\x12\x34\x56\x78\x9a\xbc\xde\xf0", 16);
+    luaSL_pushuuidbytes(L, (const uint8_t *)"\x12\x34\x56\x78\x9a\xbc\xde\xf0\x12\x34\x56\x78\x9a\xbc\xde\xf0");
 
-    require_weak_uuid_counts(L, weak_idx, 1, 1);
+    require_weak_uuid_counts(L, weak_idx, 0, 1);
 
-    lua_LSLUUID *bin_uuid = (lua_LSLUUID*)lua_touserdatatagged(L, -1, UTAG_UUID);
-    lua_LSLUUID *real_uuid = (lua_LSLUUID*)lua_touserdatatagged(L, -2, UTAG_UUID);
-    REQUIRE_NE(bin_uuid, real_uuid);
-    REQUIRE_EQ(bin_uuid->str, real_uuid->str);
+    REQUIRE_EQ(luaA_toobject(L, -1)->value.gc, luaA_toobject(L, -2)->value.gc);
 
     lua_pop(L, 1);
     lua_gc(L, LUA_GCCOLLECT, 0);
@@ -479,7 +503,7 @@ TEST_CASE("UUID interning")
     lua_gc(L, LUA_GCCOLLECT, 0);
 
     // Test that UUIDs have value semantics in user weak tables (memcat > 1)
-    lua_setmemcat(L, 2);
+    lua_setmemcat(L, LUA_FIRST_USER_MEMCAT);
 
     // Create a weak-keyed table
     int user_weak_table_idx = create_weak_table(L, "k");
@@ -561,15 +585,67 @@ TEST_CASE("UUID interning")
     const char* str = luaL_tolstring(L, -1, &len);
     REQUIRE_EQ(std::string(str), "bbbbbbbb-cccc-dddd-eeee-ffffffffffff");
     lua_pop(L, 2); // pop string and UUID
+
+    // The GC's traversal never scans the entries of a both-weak table and never
+    // scans the array part of a weak-value table, so value-semantics UUIDs whose
+    // only references live in those slots must still stay interned and keep their
+    // underlying TString alive across collections.
+
+    // UUID held only by a node entry in a "kv" table
+    int user_kv_table_idx = create_weak_table(L, "kv");
+    lua_pushstring(L, "kv_key");
+    luaSL_pushuuidstring(L, "cccccccc-dddd-eeee-ffff-000000000001");
+    GCObject* kv_uuid_ptr = luaA_toobject(L, -1)->value.gc;
+    lua_settable(L, user_kv_table_idx);
+
+    // UUID held only by an array slot in a "v" table
+    int user_weak_array_idx = create_weak_table(L, "v", 1);
+    luaSL_pushuuidstring(L, "cccccccc-dddd-eeee-ffff-000000000002");
+    GCObject* arr_uuid_ptr = luaA_toobject(L, -1)->value.gc;
+    lua_rawseti(L, user_weak_array_idx, 1);
+
+    // Two full cycles: the first can evict the interning entries while the UUIDs
+    // are unmarked, the second then sweeps the orphaned TStrings.
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+
+    // The weak entries themselves must survive (value semantics)
+    REQUIRE_EQ(get_num_table_keys(L, user_kv_table_idx), 1);
+    lua_rawgeti(L, user_weak_array_idx, 1);
+    REQUIRE(lua_isuserdata(L, -1));
+    lua_pop(L, 1);
+
+    // The interning entries must survive too: 3 from above plus these 2
+    require_weak_uuid_counts(L, weak_idx, 0, 5);
+
+    // The underlying TStrings must be intact (ASAN flags a swept TString here)
+    lua_pushstring(L, "kv_key");
+    lua_gettable(L, user_kv_table_idx);
+    str = luaL_tolstring(L, -1, &len);
+    REQUIRE_EQ(std::string(str), "cccccccc-dddd-eeee-ffff-000000000001");
+    lua_pop(L, 2);
+
+    lua_rawgeti(L, user_weak_array_idx, 1);
+    str = luaL_tolstring(L, -1, &len);
+    REQUIRE_EQ(std::string(str), "cccccccc-dddd-eeee-ffff-000000000002");
+    lua_pop(L, 2);
+
+    // Pushing the same UUIDs again must yield the same interned instances
+    luaSL_pushuuidstring(L, "cccccccc-dddd-eeee-ffff-000000000001");
+    REQUIRE_EQ(luaA_toobject(L, -1)->value.gc, kv_uuid_ptr);
+    luaSL_pushuuidstring(L, "cccccccc-dddd-eeee-ffff-000000000002");
+    REQUIRE_EQ(luaA_toobject(L, -1)->value.gc, arr_uuid_ptr);
+    lua_pop(L, 2);
 }
 
 TEST_CASE("UUID interning (GC Fixed)")
 {
-    // Do nothing, just set up the state so we can poke it directly
+    // Do nothing, just set up the state so we can poke it directly.
+    // Skip LSL constant globals so the UUID weak tables start empty.
     auto state = runConformance("nothing.lua", nullptr, [](lua_State *L) {
         luaSL_pushuuidstring(L, "12345678-9abc-def0-1234-56789abcdef0");
         lua_setglobal(L, "test_uuid");
-    });
+    }, nullptr, nullptr, false);
     lua_State *L = lua_tothread(state.get(), 1);
     REQUIRE(L);
 
@@ -637,6 +713,86 @@ TEST_CASE("Can interrupt everywhere in simple script")
             }
         };
     });
+}
+
+// Same script, but every interrupt the predicate okays actually breaks and
+// the thread is resumed there. An instruction wrongly marked preemptible shows
+// up as a wrong result rather than as a classifier assert.
+TEST_CASE("Can break everywhere the engine allows")
+{
+    auto state = runConformance("json_encode_sl.lua", nullptr, [](lua_State *L) {
+        lua_pushcfunction(L, lua_silence, "print");
+        lua_setglobal(L, "print");
+        lua_callbacks(L)->interrupt = [](lua_State *L, int gc) {
+            if (gc >= 0)
+                return;
+            if (luaSL_may_interrupt(L) != YieldableStatus::OK)
+                return;
+
+            auto *ud = (SLTestRuntimeState*)L->userdata;
+            // Resuming re-executes the broken instruction, and with it this
+            // check. Let that one through so the script makes progress.
+            const Instruction* pc = L->ci->savedpc;
+            if (pc == ud->last_break_pc)
+            {
+                ud->last_break_pc = nullptr;
+                return;
+            }
+            ud->last_break_pc = pc;
+            ud->break_num++;
+            lua_break(L);
+        };
+    });
+    CHECK(((SLTestRuntimeState*)state->userdata)->break_num > 100);
+}
+
+// Breaks wherever the predicate allows and records the opcode broken at, and
+// the builtin for a fastcall. The script's own assert proves each broken
+// instruction re-executed exactly once.
+TEST_CASE("Straight-line allocations and fastcalls are break points")
+{
+    static std::set<int> broken_at;
+    static std::set<int> broken_builtins;
+    broken_at.clear();
+    broken_builtins.clear();
+
+    runConformance("straightline_interrupts.lua", nullptr, [](lua_State *L) {
+        lua_callbacks(L)->interrupt = [](lua_State *L, int gc) {
+            if (gc >= 0)
+                return;
+            if (luaSL_may_interrupt(L) != YieldableStatus::OK)
+                return;
+
+            auto *ud = (SLTestRuntimeState*)L->userdata;
+            // The resumed instruction checks again. Let it run this time.
+            const Instruction* pc = L->ci->savedpc;
+            if (pc == ud->last_break_pc)
+            {
+                ud->last_break_pc = nullptr;
+                return;
+            }
+            ud->last_break_pc = pc;
+            // savedpc was advanced past the instruction before the check
+            int op = LUAU_INSN_OP(pc[-1]);
+            broken_at.insert(op);
+            if (op == LOP_FASTCALL || op == LOP_FASTCALL1 || op == LOP_FASTCALL2 || op == LOP_FASTCALL2K || op == LOP_FASTCALL3)
+                broken_builtins.insert(LUAU_INSN_A(pc[-1]));
+            lua_break(L);
+        };
+    });
+
+    for (int op : {LOP_NEWTABLE, LOP_DUPTABLE, LOP_CONCAT, LOP_NEWCLOSURE, LOP_FASTCALL, LOP_FASTCALL1, LOP_FASTCALL2, LOP_FASTCALL2K, LOP_FASTCALL3})
+    {
+        CAPTURE(op);
+        CHECK(broken_at.count(op) == 1);
+    }
+    for (int bfid : {LBF_TOSTRING, LBF_STRING_SUB, LBF_STRING_CHAR})
+    {
+        CAPTURE(bfid);
+        CHECK(broken_builtins.count(bfid) == 1);
+    }
+    CHECK(broken_builtins.count(LBF_MATH_ABS) == 0);
+    CHECK(broken_builtins.count(LBF_MATH_MAX) == 0);
 }
 
 static int breakable_count = 0;
@@ -709,18 +865,20 @@ TEST_CASE("Can break at tail of LOP_CALL")
     // Make sure the function actually ran
     CHECK_EQ(breakable_count, 3);
     // Expected breaks: 3 breakable() calls (each with call + tail = 6),
-    // LLEvents:on call, nothing(m[1]) call, m:foo call, return = 10 total
+    // LLEvents:on call, nothing(m[1]) call, m:foo call, return = 10, plus the
+    // first line's `{}` and `{...}` = 12 total
     // Note: NAMECALL is no longer preemptible - only the following CALL interrupts
-    CHECK_EQ(((SLTestRuntimeState*)state->userdata)->break_num, 10);
-    // Total interrupts: 10 breaks + 6 re-triggers (CALL only, not tail checks)
-    // + 5 non-breaking (setmetatable, 2 NAMECALL __index, m[1] __index, m[2] __newindex) = 21
-    CHECK_EQ(((SLTestRuntimeState*)state->userdata)->interrupt_call_count, 21);
+    CHECK_EQ(((SLTestRuntimeState*)state->userdata)->break_num, 12);
+    // Total interrupts: 12 breaks + 8 re-triggers (CALL and the first line's
+    // two tables, not tail checks) + 5 non-breaking (setmetatable, 2 NAMECALL
+    // __index, m[1] __index, m[2] __newindex) = 25
+    CHECK_EQ(((SLTestRuntimeState*)state->userdata)->interrupt_call_count, 25);
 }
 
 TEST_CASE("String comparisons work with a non-default memcat")
 {
     runConformance("string_equality.lua", nullptr, [](lua_State *L) {
-        lua_setmemcat(L, 2);
+        lua_setmemcat(L, LUA_FIRST_USER_MEMCAT);
     });
 }
 
@@ -729,9 +887,73 @@ TEST_CASE("Integer bitwise operations")
     runConformance("integer_bitwise.lua");
 }
 
+TEST_CASE("bit32.s32")
+{
+    runConformance("bit32_s32.lua");
+}
+
+// ServerLua: shared interrupt infrastructure for lljson yield tests
+static bool jsonInterruptEnabled = false;
+static int jsonYieldCount = 0;
+
+static void setupJsonInterruptInfra(lua_State* L)
+{
+    jsonInterruptEnabled = false;
+    jsonYieldCount = 0;
+
+    lua_pushcfunction(
+        L,
+        [](lua_State* L) -> int
+        {
+            jsonYieldCount = 0;
+            return 0;
+        },
+        "clear_check_count"
+    );
+    lua_setglobal(L, "clear_check_count");
+
+    lua_pushcfunction(
+        L,
+        [](lua_State* L) -> int
+        {
+            lua_pushinteger(L, jsonYieldCount);
+            return 1;
+        },
+        "get_check_count"
+    );
+    lua_setglobal(L, "get_check_count");
+
+    lua_pushcfunction(
+        L,
+        [](lua_State* L) -> int
+        {
+            jsonInterruptEnabled = true;
+            return 0;
+        },
+        "enable_check_interrupt"
+    );
+    lua_setglobal(L, "enable_check_interrupt");
+
+    lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+    {
+        if (gc != LUA_INTERRUPT_LLLIB)
+            return;
+        if (!jsonInterruptEnabled)
+            return;
+        jsonYieldCount++;
+        lua_yield(L, 0);
+    };
+}
+
 TEST_CASE("lljson")
 {
-    runConformance("lljson.lua");
+    runConformance("lljson.lua", nullptr, setupJsonInterruptInfra);
+}
+
+TEST_CASE("lljson_replacer")
+{
+    runConformance("lljson_replacer.lua", nullptr, setupJsonInterruptInfra);
+    runConformance("lljson_typedjson.lua", nullptr, setupJsonInterruptInfra);
 }
 
 TEST_CASE("llbase64")
@@ -746,7 +968,15 @@ TEST_CASE("llcompat")
 
 TEST_CASE("dangerouslyexecuterequiredmodule")
 {
-    runConformance("dangerouslyexecuterequiredmodule.lua");
+    // The yield rejection has a separate finish path for each value of the flag
+    for (bool finally : {false, true})
+    {
+        SUBCASE(finally ? "LuauCoroutineFinally" : "no LuauCoroutineFinally")
+        {
+            ScopedFastFlag coroutine_finally{FFlag::LuauCoroutineFinally, finally};
+            runConformance("dangerouslyexecuterequiredmodule.lua");
+        }
+    }
 }
 
 TEST_CASE("dangerouslyexecuterequiredmodule with breaks")
@@ -772,6 +1002,11 @@ TEST_CASE("Ares Scavenger")
     runConformance("ares_scavenger.lua");
 }
 
+static const luaL_Reg test_ll_events_lib[] = {
+    {"AdjustDamage", [](lua_State *L) {return 0;}},
+    {nullptr, nullptr}
+};
+
 TEST_CASE("LLEvents")
 {
     runConformance("llevents.lua", nullptr, [](lua_State *L) {
@@ -786,6 +1021,8 @@ TEST_CASE("LLEvents")
             }
             return true;
         };
+
+        luaL_register_noclobber(L, LUA_LLLIBNAME, test_ll_events_lib);
     });
 }
 
@@ -831,6 +1068,28 @@ TEST_CASE("LLTimers")
             // For tests, we manually call _tick() and capture the interval
             last_timer_interval = interval;
         };
+    });
+}
+
+static const luaL_Reg test_ll_prim_lib[] = {
+    // llprim.ParamSetter:apply() routes through this on the base globals.
+    // We capture its args into Lua globals so the test can verify them.
+    {"SetLinkPrimitiveParamsFast", [](lua_State *L) {
+        luaL_checkinteger(L, 1);
+        luaL_checktype(L, 2, LUA_TTABLE);
+        lua_pushvalue(L, 1);
+        lua_setglobal(L, "captured_apply_link");
+        lua_pushvalue(L, 2);
+        lua_setglobal(L, "captured_apply_rules");
+        return 0;
+    }},
+    {nullptr, nullptr}
+};
+
+TEST_CASE("llprim")
+{
+    runConformance("llprim.lua", nullptr, [](lua_State *L) {
+        luaL_register_noclobber(L, LUA_LLLIBNAME, test_ll_prim_lib);
     });
 }
 
@@ -894,6 +1153,44 @@ TEST_CASE("Table Clone OoM")
     });
 }
 
+// Returns the walked heap size for the user thread; under SLuaEagerWeakClear
+// the walk also clears weak references to otherwise-unreachable objects.
+static int lua_used_memory(lua_State* L)
+{
+    lua_State* GL = lua_mainthread(L);
+    RuntimeState* state = (RuntimeState*)GL->userdata;
+    lua_pushinteger(L, (int)lua_userthreadgc(GL, &state->free_objects));
+    return 1;
+}
+
+TEST_CASE("Weak Table Clearing")
+{
+    ScopedFastFlag eager_weak_clear{FFlag::SLuaEagerWeakClear, true};
+
+    runConformance("weak_table_clear.lua", nullptr, [](lua_State *L) {
+        lua_pushcfunction(L, lua_used_memory, "used_memory");
+        lua_setglobal(L, "used_memory");
+
+        lua_pushcfunction(L, lua_table_sizes, "table_sizes");
+        lua_setglobal(L, "table_sizes");
+    });
+}
+
+TEST_CASE("Weak Table OoM")
+{
+    ScopedFastFlag eager_weak_clear{FFlag::SLuaEagerWeakClear, true};
+
+    runConformance("weak_table_oom.lua", nullptr, [](lua_State *L) {
+        RuntimeState* state = (RuntimeState*)L->userdata;
+        state->max_mem = 48000;
+
+        lua_pushcfunction(L, [](lua_State *L) {lua_setmemcat(L, luaL_checkinteger(L, 1)); return 0;}, "change_memcat");
+        lua_setglobal(L, "change_memcat");
+
+        lua_callbacks(L)->beforeallocate = memoryLimitCallback;
+    });
+}
+
 TEST_CASE("User thread alloc size calculation")
 {
     runConformance("responsive_gc.lua", nullptr, [](lua_State *L) {
@@ -920,6 +1217,13 @@ static int check_callback_ran(lua_State* L)
 {
     RuntimeState* state = (RuntimeState*)L->userdata;
     lua_pushboolean(L, state->callback_ran);
+    return 1;
+}
+
+static int check_interrupt_ran(lua_State* L)
+{
+    RuntimeState* state = (RuntimeState*)L->userdata;
+    lua_pushboolean(L, !state->interrupt_should_clear);
     return 1;
 }
 
@@ -963,6 +1267,7 @@ TEST_CASE("Metamethods and library callbacks receive interrupt checks")
             case LUA_INTERRUPT_METAMETHOD:
             case LUA_INTERRUPT_LLLIB:
             case LUA_INTERRUPT_STDLIB:
+            case LUA_INTERRUPT_COERCION:
                 break;
             default:
                 return;
@@ -978,6 +1283,9 @@ TEST_CASE("Metamethods and library callbacks receive interrupt checks")
 
         lua_pushcfunction(L, check_callback_ran, "check_callback_ran");
         lua_setglobal(L, "check_callback_ran");
+
+        lua_pushcfunction(L, check_interrupt_ran, "check_interrupt_ran");
+        lua_setglobal(L, "check_interrupt_ran");
 
         lua_pushcfunction(L, test_callback, "test_callback");
         lua_setglobal(L, "test_callback");
@@ -995,6 +1303,615 @@ TEST_CASE("Table Sizing")
         lua_pushcfunction(L, [](lua_State *L) {lua_setmemcat(L, luaL_checkinteger(L, 1)); return 0;}, "change_memcat");
         lua_setglobal(L, "change_memcat");
     });
+}
+
+// The ABI version the test yieldables write and answer with, so a test can
+// move it between persisting and unpersisting
+static uint8_t testAbiVersion = 0;
+
+// Yieldable C function test using lyieldable.h framework.
+// Takes a callback and a count n, calls callback(i) for i=1..n,
+// accumulates return values and returns the sum.
+DEFINE_YIELDABLE(test_yieldable_sum, testAbiVersion)
+{
+    YIELDABLE_RETURNS_DEFAULT;
+
+    // If you want to be able to yield at this function call level,
+    // you need to define names for all the places you might yield.
+    // So we know where to jump to when we resume.
+    enum class Phase : uint8_t {
+        DEFAULT = 0,
+        CALL_CALLBACK = 1,
+    };
+
+    // All slots must be finalized before we do any init code.
+    SlotManager slots(L, is_init, abi_version);
+
+    // Phase storage is explicit
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, i, 1);
+    DEFINE_SLOT(int32_t, n, 0);
+    DEFINE_SLOT(int32_t, accumulator, 0);
+
+    slots.finalize();
+
+    // Args always start at position 2.
+    if (is_init)
+    {
+        luaL_checktype(L, 2, LUA_TFUNCTION);
+        n = luaL_checkinteger(L, 3);
+    }
+
+    // Denotes where we can actually begin yielding. Any setup should
+    // be done by this point
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(CALL_CALLBACK);
+    YIELD_DISPATCH_END();
+
+    for (; i <= n; ++i)
+    {
+        // Push callback and argument
+        lua_pushvalue(L, 2);
+        lua_pushinteger(L, i);
+        YIELD_CALL(L, 1, 1, CALL_CALLBACK);
+        // Accumulate the return value
+        accumulator += lua_tointeger(L, -1);
+        lua_pop(L, 1);
+    }
+
+    lua_pushinteger(L, accumulator);
+    return 1;
+}
+
+// Helper function with chained SlotManager. Calls callback(i) for
+// i=start..start+count-1, accumulates results into the parent's accumulator
+// slot (passed by reference).
+static void test_yieldable_inner(lua_State* L, SlotManager& parentSlots, int32_t& accumulator)
+{
+    YIELDABLE_RETURNS_VOID;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+        CALL_CALLBACK = 1,
+    };
+
+    SlotManager slots(parentSlots);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, i, 0);
+    DEFINE_SLOT(int32_t, end, 0);
+    slots.finalize();
+
+    if (slots.isInit())
+    {
+        // Args: [2: callback] [3: start] [4: count]
+        i = luaL_checkinteger(L, 3);
+        end = i + luaL_checkinteger(L, 4);
+    }
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(CALL_CALLBACK);
+    YIELD_DISPATCH_END();
+
+    for (; i < end; ++i)
+    {
+        lua_pushvalue(L, 2);
+        lua_pushinteger(L, i);
+        YIELD_CALL(L, 1, 1, CALL_CALLBACK);
+        accumulator += lua_tointeger(L, -1);
+        lua_pop(L, 1);
+    }
+}
+
+// Outer yieldable function that delegates to test_yieldable_inner.
+// Takes (callback, start, count) and returns accumulated sum.
+// Calls callback(0) first (a yieldable call in the parent) before
+// delegating to the helper — this proves that slots.isInit() in the
+// helper returns true even when the parent has already yielded & resumed.
+DEFINE_YIELDABLE(test_yieldable_chained, testAbiVersion)
+{
+    YIELDABLE_RETURNS_DEFAULT;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+        PRE_CALL = 1,
+        HELPER_CALL = 2,
+    };
+
+    SlotManager slots(L, is_init, abi_version);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, accumulator, 0);
+    slots.finalize();
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(PRE_CALL);
+    YIELD_DISPATCH(HELPER_CALL);
+    YIELD_DISPATCH_END();
+
+    // Call callback(0) in the parent before entering the helper.
+    // The result is added to accumulator, but callback(0) typically
+    // returns 0 so it doesn't affect the sum.
+    lua_pushvalue(L, 2);
+    lua_pushinteger(L, 0);
+    YIELD_CALL(L, 1, 1, PRE_CALL);
+    accumulator += lua_tointeger(L, -1);
+    lua_pop(L, 1);
+
+    YIELD_HELPER(L, HELPER_CALL, test_yieldable_inner(L, slots, accumulator));
+
+    lua_pushinteger(L, accumulator);
+    return 1;
+}
+
+// Recursive helper: calls callback(n), accumulates result, then recurses with n-1.
+// Stack layout: [1: nil/buf] [2: callback] [3: n]
+static void test_yieldable_recursive_sum(lua_State* L, SlotManager& parentSlots, int32_t& accumulator)
+{
+    YIELDABLE_RETURNS_VOID;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+        CALL_CALLBACK = 1,
+        RECURSE = 2,
+    };
+
+    SlotManager slots(parentSlots);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, n, 0);
+    slots.finalize();
+
+    if (slots.isInit())
+    {
+        n = luaL_checkinteger(L, 3);
+    }
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(CALL_CALLBACK);
+    YIELD_DISPATCH(RECURSE);
+    YIELD_DISPATCH_END();
+
+    if (n > 0)
+    {
+        // Call callback(n) — callback is at position 2
+        lua_pushvalue(L, 2);
+        lua_pushinteger(L, n);
+        YIELD_CALL(L, 1, 1, CALL_CALLBACK);
+        accumulator += lua_tointeger(L, -1);
+        lua_pop(L, 1);
+
+        // Recurse with n-1
+        lua_pushinteger(L, n - 1);
+        lua_replace(L, 3);
+        YIELD_HELPER(L, RECURSE, test_yieldable_recursive_sum(L, slots, accumulator));
+    }
+}
+
+// Outer yieldable: takes (callback, n), returns sum of callback(i) for i=n..1.
+DEFINE_YIELDABLE(test_yieldable_recursive, 0)
+{
+    YIELDABLE_RETURNS_DEFAULT;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+        HELPER_CALL = 1,
+    };
+
+    SlotManager slots(L, is_init, abi_version);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, accumulator, 0);
+    slots.finalize();
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(HELPER_CALL);
+    YIELD_DISPATCH_END();
+
+    YIELD_HELPER(L, HELPER_CALL, test_yieldable_recursive_sum(L, slots, accumulator));
+
+    lua_pushinteger(L, accumulator);
+    return 1;
+}
+
+// A slot wide enough that two of them across a chain overflow the uint16
+// region offsets. finalize has to refuse the layout.
+struct YieldPad
+{
+    char bytes[40000];
+};
+
+static void test_yieldable_wide_inner(lua_State* L, SlotManager& parentSlots)
+{
+    YIELDABLE_RETURNS_VOID;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+    };
+
+    SlotManager slots(parentSlots);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(YieldPad, pad, {});
+    slots.finalize();
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH_END();
+}
+
+DEFINE_YIELDABLE(test_yieldable_wide, 0)
+{
+    YIELDABLE_RETURNS_DEFAULT;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+        HELPER_CALL = 1,
+    };
+
+    SlotManager slots(L, is_init, abi_version);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(YieldPad, pad, {});
+    slots.finalize();
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(HELPER_CALL);
+    YIELD_DISPATCH_END();
+
+    YIELD_HELPER(L, HELPER_CALL, test_yieldable_wide_inner(L, slots));
+
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+// Simple yieldable function that yields via YIELD_CHECK (interrupt-driven).
+// Takes n, sums 1..n. No callback — yields happen purely from the interrupt handler.
+DEFINE_YIELDABLE(test_yieldable_check_sum, 0)
+{
+    YIELDABLE_RETURNS_DEFAULT;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+        CHECK_POINT = 1,
+    };
+
+    SlotManager slots(L, is_init, abi_version);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, i, 1);
+    DEFINE_SLOT(int32_t, n, 0);
+    DEFINE_SLOT(int32_t, accumulator, 0);
+    slots.finalize();
+
+    if (is_init)
+        n = luaL_checkinteger(L, 2);
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(CHECK_POINT);
+    YIELD_DISPATCH_END();
+
+    for (; i <= n; ++i)
+    {
+        YIELD_CHECK(L, CHECK_POINT, -100);
+        accumulator += i;
+    }
+
+    lua_pushinteger(L, accumulator);
+    return 1;
+}
+
+// Inner helper with child SlotManager that yields via YIELD_CHECK.
+// Sums start..start+count-1 into parent's accumulator.
+static void test_yieldable_inner_check(lua_State* L, SlotManager& parentSlots, int32_t& accumulator)
+{
+    YIELDABLE_RETURNS_VOID;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+        CHECK_POINT = 1,
+    };
+
+    SlotManager slots(parentSlots);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, i, 0);
+    DEFINE_SLOT(int32_t, end, 0);
+    slots.finalize();
+
+    if (slots.isInit())
+    {
+        // No callback at position 2 (unlike YIELD_CALL version), so
+        // start is at position 2, count at position 3
+        i = luaL_checkinteger(L, 2);
+        end = i + luaL_checkinteger(L, 3);
+    }
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(CHECK_POINT);
+    YIELD_DISPATCH_END();
+
+    for (; i < end; ++i)
+    {
+        YIELD_CHECK(L, CHECK_POINT, -100);
+        accumulator += i;
+    }
+}
+
+// Outer function with parent YIELD_CHECK + YIELD_HELPER to child.
+// Takes (start, count), returns sum of start..start+count-1.
+DEFINE_YIELDABLE(test_yieldable_chained_check, 0)
+{
+    YIELDABLE_RETURNS_DEFAULT;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+        PRE_CHECK = 1,
+        HELPER_CALL = 2,
+    };
+
+    SlotManager slots(L, is_init, abi_version);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, accumulator, 0);
+    slots.finalize();
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(PRE_CHECK);
+    YIELD_DISPATCH(HELPER_CALL);
+    YIELD_DISPATCH_END();
+
+    YIELD_CHECK(L, PRE_CHECK, -100);
+
+    YIELD_HELPER(L, HELPER_CALL, test_yieldable_inner_check(L, slots, accumulator));
+
+    lua_pushinteger(L, accumulator);
+    return 1;
+}
+
+// Runs test_yieldable_sum's continuation over hand-built yield state bytes:
+// (bytes, callback, n, pending callback result) -> whatever the resume returns
+static int call_test_sum_k(lua_State* L)
+{
+    size_t len;
+    const char* bytes = luaL_checklstring(L, 1, &len);
+    void* buffer = lua_newuserdatatagged(L, len, UTAG_YIELD_STATE);
+    memcpy(buffer, bytes, len);
+    lua_replace(L, 1);
+    return test_yieldable_sum_k(L, 0);
+}
+
+TEST_CASE("Lyieldable")
+{
+    testAbiVersion = 0;
+    runConformance("lyieldable.luau", nullptr, [](lua_State* L) {
+        lua_pushcclosurek(L, test_yieldable_sum, "test_yieldable_sum", 0, test_yieldable_sum_k);
+        lua_setglobal(L, "yieldable_sum");
+
+        lua_pushcclosurek(L, test_yieldable_chained, "test_yieldable_chained", 0, test_yieldable_chained_k);
+        lua_setglobal(L, "yieldable_chained");
+
+        lua_pushcclosurek(L, test_yieldable_recursive, "test_yieldable_recursive", 0, test_yieldable_recursive_k);
+        lua_setglobal(L, "yieldable_recursive");
+
+        lua_pushcclosurek(L, test_yieldable_wide, "test_yieldable_wide", 0, test_yieldable_wide_k);
+        lua_setglobal(L, "yieldable_wide");
+
+        lua_pushcfunction(
+            L,
+            [](lua_State* L) -> int
+            {
+                testAbiVersion = (uint8_t)luaL_checkinteger(L, 1);
+                return 0;
+            },
+            "set_test_abi_version"
+        );
+        lua_setglobal(L, "set_test_abi_version");
+
+        lua_pushcfunction(L, call_test_sum_k, "call_test_sum_k");
+        lua_setglobal(L, "call_test_sum_k");
+    });
+}
+
+static int checkYieldCount = 0;
+
+TEST_CASE("LyieldableCheck")
+{
+    runConformance(
+        "lyieldable_check.luau",
+        nullptr,
+        [](lua_State* L)
+        {
+            lua_pushcclosurek(L, test_yieldable_check_sum, "test_yieldable_check_sum", 0, test_yieldable_check_sum_k);
+            lua_setglobal(L, "yieldable_check_sum");
+
+            lua_pushcclosurek(L, test_yieldable_chained_check, "test_yieldable_chained_check", 0, test_yieldable_chained_check_k);
+            lua_setglobal(L, "yieldable_chained_check");
+
+            // clear_check_count() — resets the yield counter
+            lua_pushcfunction(
+                L,
+                [](lua_State* L) -> int
+                {
+                    checkYieldCount = 0;
+                    return 0;
+                },
+                "clear_check_count"
+            );
+            lua_setglobal(L, "clear_check_count");
+
+            // get_check_count() — returns the yield counter
+            lua_pushcfunction(
+                L,
+                [](lua_State* L) -> int
+                {
+                    lua_pushinteger(L, checkYieldCount);
+                    return 1;
+                },
+                "get_check_count"
+            );
+            lua_setglobal(L, "get_check_count");
+
+            // Install interrupt that yields on every YIELD_CHECK hit
+            lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+            {
+                if (gc != -100)
+                    return;
+                checkYieldCount++;
+                lua_yield(L, 0);
+            };
+        }
+    );
+}
+
+TEST_CASE("Memory hygiene")
+{
+    runConformance("memory_hygiene.lua");
+}
+
+// Expose fn as a global with def as upvalue 1
+static void registerRulesetTestFn(lua_State* L, const char* name, lua_CFunction fn, const RulesetBuilderDef* def)
+{
+    lua_pushlightuserdata(L, (void*)def);
+    lua_pushcclosurek(L, fn, name, 1, nullptr);
+    lua_setglobal(L, name);
+}
+
+TEST_CASE("llparticle")
+{
+    static const RulesetParamDescriptor kDescs[] = {
+        {"flags",         'i',  0},
+        {"color_begin",   'v',  1},
+        {"alpha_begin",   'f',  2},
+        {"burst_rate",    'f', 13},
+    };
+    static const RulesetFlagDescriptor kFlagDescs[] = {
+        {"color_interp",  0x1, 0},
+        {"scale_interp",  0x2, 0},
+        {"bounce",        0x4, 0},
+        {"emissive",    0x100, 0},
+    };
+    static RulesetBuilderDef* s_def = []() {
+        auto* d = ruleset_builder_def_build(kDescs, std::size(kDescs));
+        ruleset_builder_def_add_flags(d, kFlagDescs, std::size(kFlagDescs));
+        return d;
+    }();
+
+    runConformance("llprim_particle.lua", nullptr, [](lua_State* L) {
+        slua_ruleset_fix_names(L, s_def);
+        lua_pushstring(L, "color_interp");
+        REQUIRE(isfixed(gcvalue(luaA_toobject(L, -1))));
+        lua_pop(L, 1);
+
+        registerRulesetTestFn(L, "serialize_particles", [](lua_State* L) -> int {
+            const auto* def = (const RulesetBuilderDef*)lua_tolightuserdata(L, lua_upvalueindex(1));
+            slua_ruleset_serialize(L, 1, def);
+            return 1;
+        }, s_def);
+    });
+}
+
+TEST_CASE("ruleset_builder_collection")
+{
+    // Synthetic descriptor table exercising the two collection semantics.
+    // tag 5: 'C' string-csv   (like PRIM_MEDIA_WHITELIST)
+    // tag 7: 'M' string-map   (like HTTP_CUSTOM_HEADER)
+    // tag 9: 's' plain string (control: must be unaffected)
+    static const RulesetParamDescriptor kDescs[] = {
+        {"whitelist",      'C',  5},
+        {"custom_headers", 'M',  7},
+        {"label",          's',  9},
+    };
+    static RulesetBuilderDef* s_def = []() {
+        return ruleset_builder_def_build(kDescs, std::size(kDescs));
+    }();
+
+    runConformance("ruleset_builder_collection.lua", nullptr, [](lua_State* L) {
+        slua_ruleset_fix_names(L, s_def);
+        lua_pushstring(L, "custom_headers");
+        REQUIRE(isfixed(gcvalue(luaA_toobject(L, -1))));
+        lua_pop(L, 1);
+
+        // Coerce params (dict->list if needed) and return them
+        registerRulesetTestFn(L, "ruleset_apply", [](lua_State* L) -> int {
+            const auto* def = (const RulesetBuilderDef*)lua_tolightuserdata(L, lua_upvalueindex(1));
+            slua_ruleset_coerce(L, 1, def);
+            lua_settop(L, 1);
+            return 1;
+        }, s_def);
+
+        // Serialize through a relative index
+        registerRulesetTestFn(L, "ruleset_serialize_rel", [](lua_State* L) -> int {
+            const auto* def = (const RulesetBuilderDef*)lua_tolightuserdata(L, lua_upvalueindex(1));
+            lua_pushvalue(L, 1);
+            slua_ruleset_serialize(L, -1, def);
+            return 1;
+        }, s_def);
+    });
+}
+
+TEST_CASE("GC fixing is limited to userdata tags that hold no references")
+{
+    // A fixed object is never traversed again, so only tags whose payload is
+    // plain data are fixable. Anything else has to be plumbed in explicitly.
+    auto state = runConformance("nothing.lua", nullptr, [](lua_State *L) {
+        // Kept in the registry so an unfixable object doesn't make _G unfixable
+        luaSL_createeventmanager(L);
+        lua_setfield(L, LUA_REGISTRYINDEX, "test_llevents");
+    });
+    lua_State *GL = state.get();
+
+    lua_getfield(GL, LUA_REGISTRYINDEX, "test_llevents");
+    REQUIRE(lua_touserdatatagged(GL, -1, UTAG_LLEVENTS) != nullptr);
+    CHECK(!isfixed(gcvalue(luaA_toobject(GL, -1))));
+    lua_pop(GL, 1);
+
+    lua_getglobal(GL, "ZERO_ROTATION");
+    REQUIRE(lua_touserdatatagged(GL, -1, UTAG_QUATERNION) != nullptr);
+    CHECK(isfixed(gcvalue(luaA_toobject(GL, -1))));
+    lua_pop(GL, 1);
+
+    lua_getglobal(GL, "NULL_KEY");
+    REQUIRE(lua_touserdatatagged(GL, -1, UTAG_UUID) != nullptr);
+    CHECK(isfixed(gcvalue(luaA_toobject(GL, -1))));
+    lua_pop(GL, 1);
+}
+
+TEST_CASE("UUID held only by a user weak table keeps its interning entry")
+{
+    // A UUID's TString lives only through the interning entry, so a UUID that
+    // survives on value semantics alone has to stay black at every atomic phase
+    // or that entry is dropped and the string dies under it.
+    auto state = runConformance("nothing.lua", nullptr, nullptr, nullptr, nullptr, false);
+    lua_State *L = lua_tothread(state.get(), 1);
+    REQUIRE(L);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+
+    auto *runtime_state = LUAU_GET_SL_VM_STATE(L);
+    static const char *uuid_str = "12345678-9abc-def0-1234-56789abcdef0";
+
+    // The UUID is a weak value in the array part and a weak key in the node part
+    int table_idx = create_weak_table(L, "kv");
+    luaSL_pushuuidstring(L, uuid_str);
+    lua_rawseti(L, table_idx, 1);
+    luaSL_pushuuidstring(L, uuid_str);
+    lua_pushboolean(L, 1);
+    lua_rawset(L, table_idx);
+
+    int weak_idx = lua_gettop(L) + 1;
+    lua_getref(L, runtime_state->uuidWeakTab);
+    lua_getref(L, runtime_state->uuidCompressedWeakTab);
+    require_weak_uuid_counts(L, weak_idx, 0, 1);
+
+    for (int i = 0; i < 3; ++i)
+    {
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        require_weak_uuid_counts(L, weak_idx, 0, 1);
+    }
+
+    lua_rawgeti(L, table_idx, 1);
+    REQUIRE(lua_touserdatatagged(L, -1, UTAG_UUID) != nullptr);
+    CHECK(std::string(luaL_tolstring(L, -1, nullptr)) == uuid_str);
+    lua_pop(L, 2);
+
+    // Dropping the table lets the UUID go, and its entry with it
+    lua_pop(L, 2);
+    lua_remove(L, table_idx);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    lua_getref(L, runtime_state->uuidWeakTab);
+    lua_getref(L, runtime_state->uuidCompressedWeakTab);
+    require_weak_uuid_counts(L, lua_gettop(L) - 1, 0, 0);
+    lua_pop(L, 2);
 }
 
 TEST_SUITE_END();

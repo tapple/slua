@@ -6,8 +6,6 @@
 
 #include <type_traits>
 
-LUAU_FASTFLAG(LuauSubtypingReportGenericBoundMismatches2);
-
 namespace Luau
 {
 
@@ -28,6 +26,22 @@ std::ostream& operator<<(std::ostream& stream, const AstName& name)
         return stream << name.value;
     else
         return stream << "<empty>";
+}
+
+static std::ostream& operator<<(std::ostream& stream, InvalidClassExtension::Context ctx)
+{
+    switch (ctx)
+    {
+    case InvalidClassExtension::ClassIsNotOpen:
+        return stream << "ClassIsNotOpen";
+    case InvalidClassExtension::NotAClass:
+        return stream << "NotAClass";
+    case InvalidClassExtension::BaseIsClassInstance:
+        return stream << "BaseIsClassInstance";
+    default:
+        LUAU_ASSERT(0);
+        return stream << "???";
+    }
 }
 
 template<typename T>
@@ -147,6 +161,9 @@ static void errorToString(std::ostream& stream, const T& err)
 
         stream << "}";
     }
+    else if constexpr (std::is_same_v<T, CyclicModuleTopLevelAccess>)
+        stream << "CyclicModuleTopLevelAccess { cyclicModuleName = " << err.cyclicModuleName << ", localName = " << err.localName
+               << ", propName = " << err.propName << " }";
     else if constexpr (std::is_same_v<T, IllegalRequire>)
         stream << "IllegalRequire { " << err.moduleName << ", reason = " << err.reason << " }";
     else if constexpr (std::is_same_v<T, FunctionExitsWithoutReturning>)
@@ -211,8 +228,8 @@ static void errorToString(std::ostream& stream, const T& err)
         for (auto [s, t] : err.recommendedArgs)
             recArgs += " " + s + ": " + toString(t);
         recArgs += " ]";
-        stream << "ExplicitFunctionAnnotationRecommended { recommmendedReturn = '" + toString(err.recommendedReturn) +
-                      "', recommmendedArgs = " + recArgs + "}";
+        stream << "ExplicitFunctionAnnotationRecommended { recommendedReturn = '" + toString(err.recommendedReturn) +
+                      "', recommendedArgs = " + recArgs + "}";
     }
     else if constexpr (std::is_same_v<T, UninhabitedTypePackFunction>)
         stream << "UninhabitedTypePackFunction { " << toString(err.tp) << " }";
@@ -237,6 +254,8 @@ static void errorToString(std::ostream& stream, const T& err)
         stream << "UnexpectedTypePackInSubtyping {  tp = '" + toString(err.tp) + "' }";
     else if constexpr (std::is_same_v<T, UserDefinedTypeFunctionError>)
         stream << "UserDefinedTypeFunctionError { " << err.message << " }";
+    else if constexpr (std::is_same_v<T, BuiltInTypeFunctionError>)
+        stream << "BuiltInTypeFunctionError { " << toString(err.error) << " }";
     else if constexpr (std::is_same_v<T, ReservedIdentifier>)
         stream << "ReservedIdentifier { " << err.name << " }";
     else if constexpr (std::is_same_v<T, CannotAssignToNever>)
@@ -276,7 +295,6 @@ static void errorToString(std::ostream& stream, const T& err)
         stream << "RecursiveRestraintViolation";
     else if constexpr (std::is_same_v<T, GenericBoundsMismatch>)
     {
-        LUAU_ASSERT(FFlag::LuauSubtypingReportGenericBoundMismatches2);
         stream << "GenericBoundsMismatch { genericName = " << std::string{err.genericName} << ", lowerBounds = [";
         for (size_t i = 0; i < err.lowerBounds.size(); ++i)
         {
@@ -302,6 +320,36 @@ static void errorToString(std::ostream& stream, const T& err)
                << ", maximumTypePacks = " << err.maximumTypePacks << " }";
     else if constexpr (std::is_same_v<T, UnappliedTypeFunction>)
         stream << "UnappliedTypeFunction {}";
+    else if constexpr (std::is_same_v<T, AmbiguousFunctionCall>)
+        stream << "AmbiguousFunctionCall { " << toString(err.function) << ", " << toString(err.arguments) << " }";
+    else if constexpr (std::is_same_v<T, UninitializedFieldAccess>)
+        stream << "UninitializedFieldAccess { " << (err.fieldName ? *err.fieldName : "self") << " }";
+    else if constexpr (std::is_same_v<T, TypeAnnotationRequired>)
+        stream << "TypeAnnotationRequired { " << toString(err.inferredTy) << " }";
+    else if constexpr (std::is_same_v<T, ConstructorsShouldNotReturnAnything>)
+        stream << "ConstructorsShouldNotReturnAnything {}";
+    else if constexpr (std::is_same_v<T, CyclicClassInheritance>)
+    {
+        stream << "CyclicClassInheritance { cycle = [";
+        bool first = true;
+        for (const Name& name : err.cycle)
+        {
+            if (first)
+                first = false;
+            else
+                stream << ", ";
+            stream << name;
+        }
+        stream << "] }";
+    }
+    else if constexpr (std::is_same_v<T, InvalidClassExtension>)
+        stream << "InvalidExtension { ctx = " << err.context << ", ty = " << toString(err.baseClass) << " }";
+    else if constexpr (std::is_same_v<T, IncompatibleClassMethodOverride>)
+        stream << "IncompatibleClassMethodOverride { method = " << err.method << ", className = " << err.className
+               << ", superName = " << err.superName << " }";
+    else if constexpr (std::is_same_v<T, IllegalClassPropertyOverride>)
+        stream << "IllegalClassPropertyOverride { property = " << err.property << ", className = " << err.className
+               << ", superName = " << err.superName << " }";
     else
         static_assert(always_false_v<T>, "Non-exhaustive type switch");
 }

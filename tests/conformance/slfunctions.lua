@@ -1,19 +1,18 @@
-local foo = integer(5)
-local bar = integer(5)
-local baz = integer(6)
+-- In Lua mode `integer` is the standard integer library, the cast function
+-- only exists in LSL mode.
+local foo = integer.create(5)
+local bar = integer.create(5)
+local baz = integer.create(6)
 local vec = vector(1, 2, 3)
 
 assert(foo == bar)
 assert(foo ~= baz)
-assert(foo + integer(1) == baz)
+assert(integer.add(foo, integer.create(1)) == baz)
 assert(foo ~= 5)
 assert(tonumber(foo) == 5)
 assert(tostring(foo) == "5")
-assert(integer("5") == foo)
-assert(typeof(integer("5")) == "integer")
-assert(integer(true) == integer(1))
-assert(integer(false) == integer(0))
-assert(integer(false, "nonsense") == integer(0))
+assert(integer.fromstring("5") == foo)
+assert(typeof(integer.fromstring("5")) == "integer")
 
 assert(tovector("<1,2,3>") == vector(1, 2, 3))
 assert(tovector("<1,2,4>") ~= vector(1, 2, 3))
@@ -55,19 +54,41 @@ assert(uuid(uuid("00000000-0000-0000-0000-00000000000a")).istruthy)
 -- This is an integer in LSL, should be a float in Lua
 assert(typeof(ll.Ceil(5)) == "number")
 
--- These should all fail gracefully
-success, err = pcall(function() tovector(tovector) end)
-assert(string.match(err, "unable to cast!"))
-success, err = pcall(function() tovector(nil) end)
-assert(string.match(err, "unable to cast!"))
+-- These should all return nil gracefully
+assert(tovector(tovector) == nil)
+assert(tovector(nil) == nil)
+assert(toquaternion(nil) == nil)
+assert(touuid(nil) == nil)
+assert(touuid(ZERO_ROTATION) == nil)
 
 assert(not pcall(function() tovector() end))
 assert(not pcall(function() toquaternion() end))
-assert(not pcall(function() integer() end))
+assert(not pcall(function() integer.create() end))
 
 -- Vector / quaternion operations should still be supported as in LSL
 assert(vec * quaternion(0, 0, 0, 1) == vec)
 -- Make sure our ll.StringLength is unicode-aware
 assert(ll.StringLength("草") == 1)
+
+-- Entry types are plain numbers in SLua mode, so they compare with the TYPE_* constants
+assert(ll.GetListEntryType({"a", 1}, 1) == TYPE_STRING)
+assert(ll.GetListEntryType({"a", 1}, 5) == 0)
+
+-- Wraparound with extreme indices: both segments are empty rather than the whole list
+assert(#ll.List2List({1, 2, 3}, 2147483647, -2147483648) == 0)
+
+-- Booleans in lists act as integers
+assert(ll.DumpList2String({"a", true, false}, "|") == "a|1|0")
+assert(ll.List2String({true, false}, 1) == "1")
+assert(ll.List2String({true, false}, 2) == "0")
+assert(ll.List2Float({true}, 1) == 1)
+
+-- A frame near LUAI_MAXCSTACK has to fail the headroom check as a stack
+-- overflow, not continue past it.
+do
+  local extra = table.create(7995, 0)
+  local ok, err = pcall(ll.DeleteSubList, {1, 2, 3}, 1, 1, table.unpack(extra))
+  assert(not ok and string.find(err, "stack overflow"), err)
+end
 
 return "OK"

@@ -86,9 +86,14 @@ typedef struct luarequire_Configuration
     // alias's path cannot be resolved relative to its configuration file.
     luarequire_NavigateResult (*jump_to_alias)(lua_State* L, void* ctx, const char* path);
 
-    // Provides a final override opportunity if an alias cannot be found in
-    // configuration files. If NAVIGATE_SUCCESS is returned, this must update
-    // the internal state to point at the aliased module. Can be left undefined.
+    // Provides an initial alias override opportunity prior to searching for
+    // configuration files. If NAVIGATE_SUCCESS is returned, the internal state
+    // must be updated to point at the aliased location. Can be left undefined.
+    luarequire_NavigateResult (*to_alias_override)(lua_State* L, void* ctx, const char* alias_unprefixed);
+
+    // Provides a final opportunity to resolve an alias if it cannot be found in
+    // configuration files. If NAVIGATE_SUCCESS is returned, the internal state
+    // must be updated to point at the aliased location. Can be left undefined.
     luarequire_NavigateResult (*to_alias_fallback)(lua_State* L, void* ctx, const char* alias_unprefixed);
 
     // Navigates through the context by making mutations to the internal state.
@@ -143,6 +148,9 @@ typedef struct luarequire_Configuration
     // number of results placed on the stack. Returning -1 directs the requiring
     // thread to yield. In this case, this thread should be resumed with the
     // module result pushed onto its stack.
+    //
+    // For modules that use export, call luarequire_createplaceholder(L) after
+    // compile to enable cyclic require support.
     int (*load)(lua_State* L, void* ctx, const char* path, const char* chunkname, const char* loadname);
 } luarequire_Configuration;
 
@@ -173,3 +181,15 @@ LUALIB_API int luarequire_clearcacheentry(lua_State* L);
 
 // Clears all entries from the require cache.
 LUALIB_API int luarequire_clearcache(lua_State* L);
+
+// Locks a placeholder table with error-throwing __index/__newindex metatables
+// to prevent access during cyclic module loading.
+LUALIB_API void luarequire_lockplaceholder(lua_State* L, int idx);
+
+// Copies all fields, metatable, and readonly state from the result table into
+// the placeholder table, replacing the lock metatable.
+LUALIB_API void luarequire_populateplaceholder(lua_State* L, int placeholderIdx, int resultIdx);
+
+// Creates a locked placeholder and caches it for the current module.
+// Call from the load callback for modules that use export.
+LUALIB_API void luarequire_createplaceholder(lua_State* L);

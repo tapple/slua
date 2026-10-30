@@ -6,10 +6,9 @@
 #include "llsl.h"
 #include "ldebug.h"
 #include "lapi.h"
+#include "lobject.h"
 
 #include <math.h>
-
-LUAU_FASTFLAGVARIABLE(LuauVectorLerp)
 
 static int vector_create(lua_State* L)
 {
@@ -23,9 +22,9 @@ static int vector_create(lua_State* L)
 #if LUA_VECTOR_SIZE == 4
     double w = count >= 4 ? luaL_checknumber(L, 4) : 0.0;
 
-    lua_pushvector(L, float(x), float(y), float(z), float(w));
+    lua_pushvector(L, LUA_VECTOR_TYPE(x), LUA_VECTOR_TYPE(y), LUA_VECTOR_TYPE(z), LUA_VECTOR_TYPE(w));
 #else
-    lua_pushvector(L, float(x), float(y), float(z));
+    lua_pushvector(L, LUA_VECTOR_TYPE(x), LUA_VECTOR_TYPE(y), LUA_VECTOR_TYPE(z));
 #endif
 
     return 1;
@@ -41,12 +40,12 @@ static int vector_call(lua_State *L)
 
 static int vector_magnitude(lua_State* L)
 {
-    const float* v = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* v = luaL_checkvector(L, 1);
 
 #if LUA_VECTOR_SIZE == 4
-    lua_pushnumber(L, sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]));
+    lua_pushnumber(L, luai_sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]));
 #else
-    lua_pushnumber(L, sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]));
+    lua_pushnumber(L, luai_sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]));
 #endif
 
     return 1;
@@ -54,14 +53,14 @@ static int vector_magnitude(lua_State* L)
 
 static int vector_normalize(lua_State* L)
 {
-    const float* v = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* v = luaL_checkvector(L, 1);
 
 #if LUA_VECTOR_SIZE == 4
-    float invSqrt = 1.0f / sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]);
+    LUA_VECTOR_TYPE invSqrt = LUA_VECTOR_TYPE(1.0) / luai_sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]);
 
     lua_pushvector(L, v[0] * invSqrt, v[1] * invSqrt, v[2] * invSqrt, v[3] * invSqrt);
 #else
-    float invSqrt = 1.0f / sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    LUA_VECTOR_TYPE invSqrt = LUA_VECTOR_TYPE(1.0) / luai_sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
 
     lua_pushvector(L, v[0] * invSqrt, v[1] * invSqrt, v[2] * invSqrt);
 #endif
@@ -71,11 +70,11 @@ static int vector_normalize(lua_State* L)
 
 static int vector_cross(lua_State* L)
 {
-    const float* a = luaL_checkvector(L, 1);
-    const float* b = luaL_checkvector(L, 2);
+    const LUA_VECTOR_TYPE* a = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* b = luaL_checkvector(L, 2);
 
 #if LUA_VECTOR_SIZE == 4
-    lua_pushvector(L, a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0], 0.0f);
+    lua_pushvector(L, a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0], 0.0);
 #else
     lua_pushvector(L, a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]);
 #endif
@@ -85,8 +84,8 @@ static int vector_cross(lua_State* L)
 
 static int vector_dot(lua_State* L)
 {
-    const float* a = luaL_checkvector(L, 1);
-    const float* b = luaL_checkvector(L, 2);
+    const LUA_VECTOR_TYPE* a = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* b = luaL_checkvector(L, 2);
 
 #if LUA_VECTOR_SIZE == 4
     lua_pushnumber(L, a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
@@ -99,12 +98,12 @@ static int vector_dot(lua_State* L)
 
 static int vector_angle(lua_State* L)
 {
-    const float* a = luaL_checkvector(L, 1);
-    const float* b = luaL_checkvector(L, 2);
-    const float* axis = luaL_optvector(L, 3, nullptr);
+    const LUA_VECTOR_TYPE* a = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* b = luaL_checkvector(L, 2);
+    const LUA_VECTOR_TYPE* axis = luaL_optvector(L, 3, nullptr);
 
     // cross(a, b)
-    float cross[] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    LUA_VECTOR_TYPE cross[] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
 
     double sinA = sqrt(cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]);
     double cosA = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -112,7 +111,7 @@ static int vector_angle(lua_State* L)
 
     if (axis)
     {
-        if (cross[0] * axis[0] + cross[1] * axis[1] + cross[2] * axis[2] < 0.0f)
+        if (cross[0] * axis[0] + cross[1] * axis[1] + cross[2] * axis[2] < 0.0)
             angle = -angle;
     }
 
@@ -122,12 +121,12 @@ static int vector_angle(lua_State* L)
 
 static int vector_floor(lua_State* L)
 {
-    const float* v = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* v = luaL_checkvector(L, 1);
 
 #if LUA_VECTOR_SIZE == 4
-    lua_pushvector(L, floorf(v[0]), floorf(v[1]), floorf(v[2]), floorf(v[3]));
+    lua_pushvector(L, luai_floor(v[0]), luai_floor(v[1]), luai_floor(v[2]), luai_floor(v[3]));
 #else
-    lua_pushvector(L, floorf(v[0]), floorf(v[1]), floorf(v[2]));
+    lua_pushvector(L, luai_floor(v[0]), luai_floor(v[1]), luai_floor(v[2]));
 #endif
 
     return 1;
@@ -135,12 +134,12 @@ static int vector_floor(lua_State* L)
 
 static int vector_ceil(lua_State* L)
 {
-    const float* v = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* v = luaL_checkvector(L, 1);
 
 #if LUA_VECTOR_SIZE == 4
-    lua_pushvector(L, ceilf(v[0]), ceilf(v[1]), ceilf(v[2]), ceilf(v[3]));
+    lua_pushvector(L, luai_ceil(v[0]), luai_ceil(v[1]), luai_ceil(v[2]), luai_ceil(v[3]));
 #else
-    lua_pushvector(L, ceilf(v[0]), ceilf(v[1]), ceilf(v[2]));
+    lua_pushvector(L, luai_ceil(v[0]), luai_ceil(v[1]), luai_ceil(v[2]));
 #endif
 
     return 1;
@@ -148,12 +147,12 @@ static int vector_ceil(lua_State* L)
 
 static int vector_abs(lua_State* L)
 {
-    const float* v = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* v = luaL_checkvector(L, 1);
 
 #if LUA_VECTOR_SIZE == 4
-    lua_pushvector(L, fabsf(v[0]), fabsf(v[1]), fabsf(v[2]), fabsf(v[3]));
+    lua_pushvector(L, luai_fabs(v[0]), luai_fabs(v[1]), luai_fabs(v[2]), luai_fabs(v[3]));
 #else
-    lua_pushvector(L, fabsf(v[0]), fabsf(v[1]), fabsf(v[2]));
+    lua_pushvector(L, luai_fabs(v[0]), luai_fabs(v[1]), luai_fabs(v[2]));
 #endif
 
     return 1;
@@ -161,12 +160,12 @@ static int vector_abs(lua_State* L)
 
 static int vector_sign(lua_State* L)
 {
-    const float* v = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* v = luaL_checkvector(L, 1);
 
 #if LUA_VECTOR_SIZE == 4
-    lua_pushvector(L, luaui_signf(v[0]), luaui_signf(v[1]), luaui_signf(v[2]), luaui_signf(v[3]));
+    lua_pushvector(L, luai_sign(v[0]), luai_sign(v[1]), luai_sign(v[2]), luai_sign(v[3]));
 #else
-    lua_pushvector(L, luaui_signf(v[0]), luaui_signf(v[1]), luaui_signf(v[2]));
+    lua_pushvector(L, luai_sign(v[0]), luai_sign(v[1]), luai_sign(v[2]));
 #endif
 
     return 1;
@@ -174,9 +173,9 @@ static int vector_sign(lua_State* L)
 
 static int vector_clamp(lua_State* L)
 {
-    const float* v = luaL_checkvector(L, 1);
-    const float* min = luaL_checkvector(L, 2);
-    const float* max = luaL_checkvector(L, 3);
+    const LUA_VECTOR_TYPE* v = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* min = luaL_checkvector(L, 2);
+    const LUA_VECTOR_TYPE* max = luaL_checkvector(L, 3);
 
     luaL_argcheck(L, min[0] <= max[0], 3, "max.x must be greater than or equal to min.x");
     luaL_argcheck(L, min[1] <= max[1], 3, "max.y must be greater than or equal to min.y");
@@ -184,14 +183,10 @@ static int vector_clamp(lua_State* L)
 
 #if LUA_VECTOR_SIZE == 4
     lua_pushvector(
-        L,
-        luaui_clampf(v[0], min[0], max[0]),
-        luaui_clampf(v[1], min[1], max[1]),
-        luaui_clampf(v[2], min[2], max[2]),
-        luaui_clampf(v[3], min[3], max[3])
+        L, luai_clamp(v[0], min[0], max[0]), luai_clamp(v[1], min[1], max[1]), luai_clamp(v[2], min[2], max[2]), luai_clamp(v[3], min[3], max[3])
     );
 #else
-    lua_pushvector(L, luaui_clampf(v[0], min[0], max[0]), luaui_clampf(v[1], min[1], max[1]), luaui_clampf(v[2], min[2], max[2]));
+    lua_pushvector(L, luai_clamp(v[0], min[0], max[0]), luai_clamp(v[1], min[1], max[1]), luai_clamp(v[2], min[2], max[2]));
 #endif
 
     return 1;
@@ -200,17 +195,17 @@ static int vector_clamp(lua_State* L)
 static int vector_min(lua_State* L)
 {
     int n = lua_gettop(L);
-    const float* v = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* v = luaL_checkvector(L, 1);
 
 #if LUA_VECTOR_SIZE == 4
-    float result[] = {v[0], v[1], v[2], v[3]};
+    LUA_VECTOR_TYPE result[] = {v[0], v[1], v[2], v[3]};
 #else
-    float result[] = {v[0], v[1], v[2]};
+    LUA_VECTOR_TYPE result[] = {v[0], v[1], v[2]};
 #endif
 
     for (int i = 2; i <= n; i++)
     {
-        const float* b = luaL_checkvector(L, i);
+        const LUA_VECTOR_TYPE* b = luaL_checkvector(L, i);
 
         if (b[0] < result[0])
             result[0] = b[0];
@@ -236,17 +231,17 @@ static int vector_min(lua_State* L)
 static int vector_max(lua_State* L)
 {
     int n = lua_gettop(L);
-    const float* v = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* v = luaL_checkvector(L, 1);
 
 #if LUA_VECTOR_SIZE == 4
-    float result[] = {v[0], v[1], v[2], v[3]};
+    LUA_VECTOR_TYPE result[] = {v[0], v[1], v[2], v[3]};
 #else
-    float result[] = {v[0], v[1], v[2]};
+    LUA_VECTOR_TYPE result[] = {v[0], v[1], v[2]};
 #endif
 
     for (int i = 2; i <= n; i++)
     {
-        const float* b = luaL_checkvector(L, i);
+        const LUA_VECTOR_TYPE* b = luaL_checkvector(L, i);
 
         if (b[0] > result[0])
             result[0] = b[0];
@@ -271,7 +266,7 @@ static int vector_max(lua_State* L)
 
 static int vector_index(lua_State* L)
 {
-    const float* v = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* v = luaL_checkvector(L, 1);
     size_t namelen = 0;
     const char* name = luaL_checklstring(L, 2, &namelen);
 
@@ -357,11 +352,12 @@ static int vector_tostring(lua_State *L)
 {
     auto* a = luaL_checkvector(L, 1);
 
-    char buf[128] = {};
+    char buf[256] = {};
     char* p = buf;
     *p++ = '<';
 
-    const char* format = LUAU_IS_LSL_VM(L) ? "%5.5f" : "%.6g";
+    bool is_lsl = LUAU_IS_LSL_VM(L);
+    const char* format = is_lsl ? "%5.5f" : "%.6f";
     for (int i = 0; i < 3; i++)
     {
         if (i > 0)
@@ -369,7 +365,10 @@ static int vector_tostring(lua_State *L)
             *p++ = ',';
             *p++ = ' ';
         }
-        p += luai_formatfloat(p, buf + sizeof(buf) - p, format, a[i]);
+        int n = luai_formatfloat(p, buf + sizeof(buf) - p, format, a[i]);
+        if (!is_lsl)
+            n = luai_trimfloat(p, n);
+        p += n;
     }
 
     *p++ = '>';
@@ -380,14 +379,14 @@ static int vector_tostring(lua_State *L)
 
 static int vector_lerp(lua_State* L)
 {
-    const float* a = luaL_checkvector(L, 1);
-    const float* b = luaL_checkvector(L, 2);
-    const float t = static_cast<float>(luaL_checknumber(L, 3));
+    const LUA_VECTOR_TYPE* a = luaL_checkvector(L, 1);
+    const LUA_VECTOR_TYPE* b = luaL_checkvector(L, 2);
+    const LUA_VECTOR_TYPE t = LUA_VECTOR_TYPE(luaL_checknumber(L, 3));
 
 #if LUA_VECTOR_SIZE == 4
-    lua_pushvector(L, luai_lerpf(a[0], b[0], t), luai_lerpf(a[1], b[1], t), luai_lerpf(a[2], b[2], t), luai_lerpf(a[3], b[3], t));
+    lua_pushvector(L, luai_lerp(a[0], b[0], t), luai_lerp(a[1], b[1], t), luai_lerp(a[2], b[2], t), luai_lerp(a[3], b[3], t));
 #else
-    lua_pushvector(L, luai_lerpf(a[0], b[0], t), luai_lerpf(a[1], b[1], t), luai_lerpf(a[2], b[2], t));
+    lua_pushvector(L, luai_lerp(a[0], b[0], t), luai_lerp(a[1], b[1], t), luai_lerp(a[2], b[2], t));
 #endif
 
     return 1;
@@ -407,6 +406,7 @@ static const luaL_Reg vectorlib[] = {
     {"clamp", vector_clamp},
     {"max", vector_max},
     {"min", vector_min},
+    {"lerp", vector_lerp},
     {NULL, NULL},
 };
 
@@ -416,9 +416,9 @@ static void createmetatable(lua_State* L)
 
     // push dummy vector
 #if LUA_VECTOR_SIZE == 4
-    lua_pushvector(L, 0.0f, 0.0f, 0.0f, 0.0f);
+    lua_pushvector(L, 0.0, 0.0, 0.0, 0.0);
 #else
-    lua_pushvector(L, 0.0f, 0.0f, 0.0f);
+    lua_pushvector(L, 0.0, 0.0, 0.0);
 #endif
 
     lua_pushvalue(L, -2);
@@ -451,22 +451,15 @@ int luaopen_vector(lua_State* L)
     [[maybe_unused]] int old_top = lua_gettop(L);
     luaL_register(L, LUA_VECLIBNAME, vectorlib);
 
-    if (FFlag::LuauVectorLerp)
-    {
-        // To unflag put {"lerp", vector_lerp} in the `vectorlib` table
-        lua_pushcfunction(L, vector_lerp, "lerp");
-        lua_setfield(L, -2, "lerp");
-    }
-
 #if LUA_VECTOR_SIZE == 4
-    lua_pushvector(L, 0.0f, 0.0f, 0.0f, 0.0f);
+    lua_pushvector(L, 0.0, 0.0, 0.0, 0.0);
     lua_setfield(L, -2, "zero");
-    lua_pushvector(L, 1.0f, 1.0f, 1.0f, 1.0f);
+    lua_pushvector(L, 1.0, 1.0, 1.0, 1.0);
     lua_setfield(L, -2, "one");
 #else
-    lua_pushvector(L, 0.0f, 0.0f, 0.0f);
+    lua_pushvector(L, 0.0, 0.0, 0.0);
     lua_setfield(L, -2, "zero");
-    lua_pushvector(L, 1.0f, 1.0f, 1.0f);
+    lua_pushvector(L, 1.0, 1.0, 1.0);
     lua_setfield(L, -2, "one");
 #endif
 
@@ -475,15 +468,6 @@ int luaopen_vector(lua_State* L)
     lua_newtable(L);
     lua_pushcfunction(L, vector_call, "__call");
     lua_setfield(L, -2, "__call");
-
-    // We need to override __iter so generalized iteration doesn't try to use __call.
-    lua_rawgetfield(L, LUA_BASEGLOBALSINDEX, "pairs");
-    // This is confusing at first, but we want a unique function identity
-    // when this shows up anywhere other than globals, otherwise we can
-    // muck up Ares serialization.
-    luau_dupcclosure(L, -1, "__iter");
-    lua_replace(L, -2);
-    lua_rawsetfield(L, -2, "__iter");
 
     lua_setreadonly(L, -1, true);
     lua_setmetatable(L, -2);

@@ -4,6 +4,7 @@
 #include "lualib.h"
 
 #include "ldebug.h"
+#include "ldo.h"
 #include "lfunc.h"
 #include "lapi.h"
 #include "lgc.h"
@@ -14,6 +15,9 @@
 
 #include <vector>
 
+LUAU_FASTFLAG(LuauCoroutineFinally)
+
+// TODO: Remove with FFlagLuauCoroutineFinally
 #define CO_STATUS_ERROR -1
 #define CO_STATUS_BREAK -2
 
@@ -27,6 +31,110 @@ static int costatus(lua_State* L)
     return 1;
 }
 
+static int interruptThread(lua_State* L, lua_State* co)
+{
+    // notify the debugger that the thread was suspended
+    if (L->global->cb.debuginterrupt)
+        luau_callhook(L, L->global->cb.debuginterrupt, co);
+
+    return lua_break(L);
+}
+
+// ServerLua: Threads the host won't let scripts act on
+static bool isrefusedthread(lua_State* L, lua_State* co)
+{
+    return L->global->cb.beforethreaduse && L->global->cb.beforethreaduse(L, co, false) != 0;
+}
+
+template<bool Wrap>
+static int auxresumefinisherror(lua_State* L, lua_State* co)
+{
+    if (Wrap)
+    {
+        if (lua_isstring(L, -1))
+        {                     // error object is a string?
+            luaL_where(L, 1); // add extra info
+            lua_insert(L, -2);
+            lua_concat(L, 2);
+        }
+        lua_error(L); // propagate error
+    }
+    else
+    {
+        lua_pushboolean(L, 0);
+        lua_insert(L, -2);
+        return 2; // return false + error message
+    }
+}
+
+template<bool Wrap>
+static LUAU_FORCEINLINE int auxresumefinishsuccess(lua_State* L, lua_State* co)
+{
+    int nres = cast_int(co->top - co->base);
+
+    if (nres + 1 > LUA_MINSTACK && !lua_checkstack(L, nres + 1))
+        luaL_error(L, "too many results to resume");
+
+    if (!Wrap)
+        lua_pushboolean(L, 1);
+
+    if (nres != 0)
+    {
+        // move yielded values
+        luaC_threadbarrier(L);
+
+        StkId totop = L->top;
+        StkId fromtop = co->top - nres;
+
+        for (int i = 0; i < nres; i++)
+            setobj2s(L, totop + i, fromtop + i);
+
+        co->top = fromtop;
+        L->top = totop + nres;
+    }
+
+    return nres + (Wrap ? 0 : 1); // non-wrap version returns additional status
+}
+
+template<bool Wrap>
+static LUAU_FORCEINLINE int auxresumefinish(lua_State* L, lua_State* co, int status)
+{
+    LUAU_ASSERT(FFlag::LuauCoroutineFinally);
+
+    if (status == LUA_YIELD)
+        return auxresumefinishsuccess<Wrap>(L, co);
+
+    // we might have reached another breakpoint in the target coroutine
+    if (LUAU_UNLIKELY(status == LUA_BREAK))
+        return interruptThread(L, co);
+
+    // ServerLua: Propagate uncatchable termination errors to parent thread
+    // before anything gets a chance to observe them as a plain error.
+    if (status == LUA_ERRKILL)
+    {
+        lua_xmove(co, L, 1); // move error message
+        lua_killerror(L, lua_tostring(L, -1)); // kill parent thread
+        // Never returns
+    }
+
+    // complete finalizers, but only if it wasn't a failure of the resume itself
+    if (status == co->status && co->finalizers)
+    {
+        if (Wrap)
+            luaL_error(L, "cannot run finalizers from a wrapped coroutine");
+
+        luaD_preparefinalize(L, co, co->status == LUA_OK ? FinallyResult::Finished : FinallyResult::Error);
+        return luaD_runfinalizers(L, /* returnstatus */ true);
+    }
+
+    if (status == LUA_OK)
+        return auxresumefinishsuccess<Wrap>(L, co);
+
+    lua_xmove(co, L, 1);
+    return auxresumefinisherror<Wrap>(L, co);
+}
+
+template<bool Wrap>
 static int auxresume(lua_State* L, lua_State* co, int narg)
 {
     // error handling for edge cases
@@ -36,7 +144,11 @@ static int auxresume(lua_State* L, lua_State* co, int narg)
         if (status != LUA_COSUS)
         {
             lua_pushfstring(L, "cannot resume %s coroutine", statnames[status]);
-            return CO_STATUS_ERROR;
+
+            if (FFlag::LuauCoroutineFinally)
+                return auxresumefinisherror<Wrap>(L, co);
+            else
+                return CO_STATUS_ERROR;
         }
     }
 
@@ -56,47 +168,48 @@ static int auxresume(lua_State* L, lua_State* co, int narg)
     co->singlestep = L->singlestep;
 
     int status = lua_resume(co, L, narg);
-    if (status == 0 || status == LUA_YIELD)
+
+    if (FFlag::LuauCoroutineFinally)
     {
-        int nres = cast_int(co->top - co->base);
-        if (nres)
-        {
-            // +1 accounts for true/false status in resumefinish
-            if (nres + 1 > LUA_MINSTACK && !lua_checkstack(L, nres + 1))
-                luaL_error(L, "too many results to resume");
-            lua_xmove(co, L, nres); // move yielded values
-        }
-        return nres;
-    }
-    else if (status == LUA_BREAK)
-    {
-        return CO_STATUS_BREAK;
-    }
-    else if (status == LUA_ERRKILL)
-    {
-        // ServerLua: Propagate uncatchable termination errors to parent thread
-        lua_xmove(co, L, 1); // move error message
-        lua_killerror(L, lua_tostring(L, -1)); // kill parent thread
-        // Never returns
+        return auxresumefinish<Wrap>(L, co, status);
     }
     else
     {
-        lua_xmove(co, L, 1); // move error message
-        return CO_STATUS_ERROR;
+        if (status == 0 || status == LUA_YIELD)
+        {
+            int nres = cast_int(co->top - co->base);
+            if (nres)
+            {
+                // +1 accounts for true/false status in resumefinish
+                if (nres + 1 > LUA_MINSTACK && !lua_checkstack(L, nres + 1))
+                    luaL_error(L, "too many results to resume");
+                lua_xmove(co, L, nres); // move yielded values
+            }
+            return nres;
+        }
+        else if (status == LUA_BREAK)
+        {
+            return CO_STATUS_BREAK;
+        }
+        else if (status == LUA_ERRKILL)
+        {
+            // ServerLua: Propagate uncatchable termination errors to parent thread
+            lua_xmove(co, L, 1); // move error message
+            lua_killerror(L, lua_tostring(L, -1)); // kill parent thread
+            // Never returns
+        }
+        else
+        {
+            lua_xmove(co, L, 1); // move error message
+            return CO_STATUS_ERROR;
+        }
     }
-}
-
-static int interruptThread(lua_State* L, lua_State* co)
-{
-    // notify the debugger that the thread was suspended
-    if (L->global->cb.debuginterrupt)
-        luau_callhook(L, L->global->cb.debuginterrupt, co);
-
-    return lua_break(L);
 }
 
 static int auxresumecont(lua_State* L, lua_State* co)
 {
+    LUAU_ASSERT(!FFlag::LuauCoroutineFinally);
+
     if (co->status == 0 || co->status == LUA_YIELD)
     {
         int nres = cast_int(co->top - co->base);
@@ -124,6 +237,8 @@ static int auxresumecont(lua_State* L, lua_State* co)
 
 static int coresumefinish(lua_State* L, int r)
 {
+    LUAU_ASSERT(!FFlag::LuauCoroutineFinally);
+
     if (r < 0)
     {
         lua_pushboolean(L, 0);
@@ -142,40 +257,87 @@ static int coresumey(lua_State* L)
 {
     lua_State* co = lua_tothread(L, 1);
     luaL_argexpected(L, co, 1, "thread");
+
+    // ServerLua: Reported like any other coroutine that can't be resumed
+    if (isrefusedthread(L, co))
+    {
+        lua_pushboolean(L, 0);
+        lua_pushliteral(L, LUA_THREADREFUSEDMSG);
+        return 2;
+    }
+
     int narg = cast_int(L->top - L->base) - 1;
-    int r = auxresume(L, co, narg);
 
-    if (r == CO_STATUS_BREAK)
-        return interruptThread(L, co);
+    if (FFlag::LuauCoroutineFinally)
+    {
+        return auxresume<false>(L, co, narg);
+    }
+    else
+    {
+        int r = auxresume<false>(L, co, narg);
 
-    return coresumefinish(L, r);
+        if (r == CO_STATUS_BREAK)
+            return interruptThread(L, co);
+
+        return coresumefinish(L, r);
+    }
 }
 
 static int coresumecont(lua_State* L, int status)
 {
-    lua_State* co = lua_tothread(L, 1);
-    luaL_argexpected(L, co, 1, "thread");
-
-    // ServerLua: This continuation might be for a thread that was in break state, try resuming it
-    int r;
-    if (co->status == LUA_BREAK)
+    if (FFlag::LuauCoroutineFinally)
     {
-        // We don't call auxresumecont in this case because it does basically the same
-        // thing as auxresume already does at the end.
-        r = auxresume(L, co, 0);
+        // finalizer errored, return false status and the error
+        if (status != LUA_OK)
+        {
+            lua_pushboolean(L, 0);
+            lua_insert(L, -2);
+            return 2;
+        }
+
+        lua_State* co = lua_tothread(L, 1);
+        luaL_argexpected(L, co, 1, "thread");
+
+        // if we haven't completed auxresume yet
+        if (lua_gettop(L) == 1)
+        {
+            // ServerLua: This continuation might be for a thread that was in break state, try resuming it
+            if (co->status == LUA_BREAK)
+                return auxresume<false>(L, co, 0);
+
+            return auxresumefinish<false>(L, co, co->status);
+        }
+
+        return luaD_runfinalizers(L, /* returnstatus */ true);
     }
     else
-        r = auxresumecont(L, co);
+    {
+        lua_State* co = lua_tothread(L, 1);
+        luaL_argexpected(L, co, 1, "thread");
 
-    // if coroutine still hasn't yielded after the break, break current thread again
-    if (co->status == LUA_BREAK)
-        return interruptThread(L, co);
+        // ServerLua: This continuation might be for a thread that was in break state, try resuming it
+        int r;
+        if (co->status == LUA_BREAK)
+        {
+            // We don't call auxresumecont in this case because it does basically the same
+            // thing as auxresume already does at the end.
+            r = auxresume<false>(L, co, 0);
+        }
+        else
+            r = auxresumecont(L, co);
 
-    return coresumefinish(L, r);
+        // if coroutine still hasn't yielded after the break, break current thread again
+        if (co->status == LUA_BREAK)
+            return interruptThread(L, co);
+
+        return coresumefinish(L, r);
+    }
 }
 
 static int auxwrapfinish(lua_State* L, int r)
 {
+    LUAU_ASSERT(!FFlag::LuauCoroutineFinally);
+
     if (r < 0)
     {
         if (lua_isstring(L, -1))
@@ -192,35 +354,59 @@ static int auxwrapfinish(lua_State* L, int r)
 static int auxwrapy(lua_State* L)
 {
     lua_State* co = lua_tothread(L, lua_upvalueindex(1));
+
+    // ServerLua: Only ever refuses a wrapped thread that was orphaned in LUA_BREAK
+    if (isrefusedthread(L, co))
+        luaL_error(L, LUA_THREADREFUSEDMSG);
+
     int narg = cast_int(L->top - L->base);
-    int r = auxresume(L, co, narg);
 
-    if (r == CO_STATUS_BREAK)
-        return interruptThread(L, co);
+    if (FFlag::LuauCoroutineFinally)
+    {
+        return auxresume<true>(L, co, narg);
+    }
+    else
+    {
+        int r = auxresume<true>(L, co, narg);
 
-    return auxwrapfinish(L, r);
+        if (r == CO_STATUS_BREAK)
+            return interruptThread(L, co);
+
+        return auxwrapfinish(L, r);
+    }
 }
 
 static int auxwrapcont(lua_State* L, int status)
 {
     lua_State* co = lua_tothread(L, lua_upvalueindex(1));
 
-    // ServerLua: This continuation might be for a thread that was in break state, try resuming it
-    int r;
-    if (co->status == LUA_BREAK)
+    if (FFlag::LuauCoroutineFinally)
     {
-        // We don't call auxresumecont in this case because it does basically the same
-        // thing as auxresume already does at the end.
-        r = auxresume(L, co, 0);
+        // ServerLua: This continuation might be for a thread that was in break state, try resuming it
+        if (co->status == LUA_BREAK)
+            return auxresume<true>(L, co, 0);
+
+        return auxresumefinish<true>(L, co, co->status);
     }
     else
-        r = auxresumecont(L, co);
+    {
+        // ServerLua: This continuation might be for a thread that was in break state, try resuming it
+        int r;
+        if (co->status == LUA_BREAK)
+        {
+            // We don't call auxresumecont in this case because it does basically the same
+            // thing as auxresume already does at the end.
+            r = auxresume<true>(L, co, 0);
+        }
+        else
+            r = auxresumecont(L, co);
 
-    // if coroutine still hasn't yielded after the break, break current thread again
-    if (co->status == LUA_BREAK)
-        return interruptThread(L, co);
+        // if coroutine still hasn't yielded after the break, break current thread again
+        if (co->status == LUA_BREAK)
+            return interruptThread(L, co);
 
-    return auxwrapfinish(L, r);
+        return auxwrapfinish(L, r);
+    }
 }
 
 static int cocreate(lua_State* L)
@@ -260,8 +446,14 @@ static int coyieldable(lua_State* L)
 
 static int coclose(lua_State* L)
 {
+    LUAU_ASSERT(!FFlag::LuauCoroutineFinally);
+
     lua_State* co = lua_tothread(L, 1);
     luaL_argexpected(L, co, 1, "thread");
+
+    // ServerLua: Refuse threads scripts may not act on
+    if (isrefusedthread(L, co))
+        luaL_error(L, LUA_THREADREFUSEDMSG);
 
     int status = lua_costatus(L, co);
     if (status != LUA_COFIN && status != LUA_COERR && status != LUA_COSUS)
@@ -289,11 +481,24 @@ static int coclose(lua_State* L)
     }
 }
 
+// ServerLua: Sends a rejected yield back into the module as an error at the
+// yield site, where the module can catch it. Returns the resulting resume status.
+static int auxsandboxedrejectyield(lua_State* L, lua_State* co, int nyielded)
+{
+    lua_pop(L, nyielded);
+    lua_pushliteral(L, "attempt to yield from sandboxed require");
+    lua_xmove(L, co, 1);
+    return lua_resumeerror(co, L);
+}
+
 // ServerLua: For mimicking sandboxing semantics of `require()`
 static int auxsandboxedfinish(lua_State* L, lua_State* co, int r)
 {
-    if (r >= 0 && co->status == LUA_YIELD)
-        luaL_error(L, "attempt to yield from sandboxed require");
+    while (r >= 0 && co->status == LUA_YIELD)
+    {
+        int status = auxsandboxedrejectyield(L, co, r);
+        r = status == LUA_BREAK ? CO_STATUS_BREAK : auxresumecont(L, co);
+    }
 
     if (r == CO_STATUS_BREAK)
         return interruptThread(L, co);
@@ -312,6 +517,23 @@ static int auxsandboxedfinish(lua_State* L, lua_State* co, int r)
     lua_remove(L, 2);
     lua_remove(L, 1);
     return r;
+}
+
+// ServerLua: Wrap-flavoured counterpart: errors have already been thrown and breaks
+// already propagated by auxresumefinish<true>, so only yield is left to reject.
+static int auxsandboxedfinishy(lua_State* L, lua_State* co, int n)
+{
+    LUAU_ASSERT(FFlag::LuauCoroutineFinally);
+
+    while (co->status == LUA_YIELD)
+        n = auxresumefinish<true>(L, co, auxsandboxedrejectyield(L, co, n));
+
+    if (co->status == LUA_BREAK)
+        return n;
+
+    lua_remove(L, 2);
+    lua_remove(L, 1);
+    return n;
 }
 
 // This is meant to allow executing code as if it was a "module" but
@@ -334,6 +556,8 @@ static int auxsandboxedfinish(lua_State* L, lua_State* co, int r)
 static int dangerouslyexecuterequiredmodule(lua_State* L)
 {
     luaL_checktype(L, 1, LUA_TFUNCTION);
+    // The continuation finds the thread at index 2
+    lua_settop(L, 1);
 
     if (!lua_isLfunction(L, 1))
         luaL_error(L, "Lua function expected");
@@ -344,7 +568,7 @@ static int dangerouslyexecuterequiredmodule(lua_State* L)
         luaL_error(L, "function with upvalues not allowed");
     // We don't currently have any system-defined Lua closures,
     // but we might at some point.
-    if (cl->memcat < 2)
+    if (cl->memcat < LUA_FIRST_USER_MEMCAT)
         luaL_error(L, "can't wrap a system lua closure");
 
     // Intentionally creating this on the main thread so that we
@@ -353,10 +577,15 @@ static int dangerouslyexecuterequiredmodule(lua_State* L)
     // mutable globals on the main thread, but that seems to
     // have been a mistake.
     lua_State* GL = lua_mainthread(L);
-    lua_State* co = lua_newthread(GL);
+    lua_State* co;
+    {
+        // The thread inherits the active memcat, and the globals proxy below is
+        // built under the thread's, so everything is charged to the caller.
+        MemcatGuard guard(GL, (uint8_t)lua_getmemcat(L));
+        co = lua_newthread(GL);
+    }
     lua_xmove(GL, L, 1);
     luaL_sandboxthread(co);
-    lua_setmemcat(co, lua_getmemcat(L));
 
     // SL needs some special logic for things that don't live on _G
     if (LUAU_IS_SL_VM(L))
@@ -432,7 +661,11 @@ static int dangerouslyexecuterequiredmodule(lua_State* L)
     setclvalue(co, co->top, newcl);
     incr_top(co);
 
-    int r = auxresume(L, co, 0);
+    int r = auxresume<true>(L, co, 0);
+
+    if (FFlag::LuauCoroutineFinally)
+        return auxsandboxedfinishy(L, co, r);
+
     return auxsandboxedfinish(L, co, r);
 }
 
@@ -440,16 +673,109 @@ static int dangerouslyexecuterequiredmodulecont(lua_State* L, int status)
 {
     lua_State* co = lua_tothread(L, 2);
 
-    int r;
-    if (co->status == LUA_BREAK)
-        r = auxresume(L, co, 0);
-    else
-        r = auxresumecont(L, co);
+    if (FFlag::LuauCoroutineFinally)
+    {
+        // This continuation might be for a thread that was in break state, try resuming it
+        int n;
+        if (co->status == LUA_BREAK)
+            n = auxresume<true>(L, co, 0);
+        else
+            n = auxresumefinish<true>(L, co, co->status);
 
-    return auxsandboxedfinish(L, co, r);
+        return auxsandboxedfinishy(L, co, n);
+    }
+    else
+    {
+        int r;
+        if (co->status == LUA_BREAK)
+            r = auxresume<true>(L, co, 0);
+        else
+            r = auxresumecont(L, co);
+
+        return auxsandboxedfinish(L, co, r);
+    }
 }
 
-static const luaL_Reg co_funcs[] = {
+static int coclosey(lua_State* L)
+{
+    LUAU_ASSERT(FFlag::LuauCoroutineFinally);
+
+    lua_State* co = lua_tothread(L, 1);
+    luaL_argexpected(L, co, 1, "thread");
+
+    // ServerLua: Refuse threads scripts may not act on
+    if (isrefusedthread(L, co))
+        luaL_error(L, LUA_THREADREFUSEDMSG);
+
+    int status = lua_costatus(L, co);
+    if (status != LUA_COFIN && status != LUA_COERR && status != LUA_COSUS)
+        luaL_error(L, "cannot close %s coroutine", statnames[status]);
+
+    if (co->status == LUA_OK || co->status == LUA_YIELD)
+    {
+        if (co->finalizers)
+        {
+            lua_settop(L, 1);
+            luaD_preparefinalizestate(L, co, FinallyResult::Cancelled);
+            lua_resetthread(co); // can be reused immediately
+            return luaD_runfinalizers(L, /* returnstatus */ true);
+        }
+
+        lua_pushboolean(L, true);
+        lua_resetthread(co);
+        return 1;
+    }
+    else
+    {
+        LUAU_ASSERT(!co->finalizers); // finalizers should have already been executed
+
+        lua_pushboolean(L, false);
+
+        if (co->status == LUA_ERRMEM)
+            lua_pushstring(L, LUA_MEMERRMSG);
+        else if (co->status == LUA_ERRERR)
+            lua_pushstring(L, LUA_ERRERRMSG);
+        else if (lua_gettop(co))
+            lua_xmove(co, L, 1); // move error message
+
+        lua_resetthread(co);
+        return 2;
+    }
+}
+
+static int coclosecont(lua_State* L, int status)
+{
+    LUAU_ASSERT(FFlag::LuauCoroutineFinally);
+
+    if (status != LUA_OK)
+    {
+        lua_pushboolean(L, 0);
+        lua_insert(L, -2);
+        return 2;
+    }
+
+    return luaD_runfinalizers(L, /* returnstatus */ true);
+}
+
+// coroutine.finally(co, callback)
+static int cofinally(lua_State* L)
+{
+    lua_State* co = lua_tothread(L, 1);
+    luaL_argexpected(L, co, 1, "thread");
+
+    // ServerLua: Refuse threads scripts may not act on
+    if (isrefusedthread(L, co))
+        luaL_error(L, LUA_THREADREFUSEDMSG);
+
+    // callback can be any callable object
+    if (lua_isnoneornil(L, 2))
+        luaL_error(L, "missing argument #%d", 2);
+
+    lua_addfinalizer(L, co, 2);
+    return 0;
+}
+
+static const luaL_Reg co_funcs_DEPRECATED[] = {
     {"create", cocreate},
     {"running", corunning},
     {"status", costatus},
@@ -460,12 +786,32 @@ static const luaL_Reg co_funcs[] = {
     {NULL, NULL},
 };
 
+static const luaL_Reg co_funcs[] = {
+    {"create", cocreate},
+    {"running", corunning},
+    {"status", costatus},
+    {"wrap", cowrap},
+    {"yield", coyield},
+    {"isyieldable", coyieldable},
+    {"finally", cofinally},
+    {NULL, NULL},
+};
+
 int luaopen_coroutine(lua_State* L)
 {
-    luaL_register(L, LUA_COLIBNAME, co_funcs);
+    if (FFlag::LuauCoroutineFinally)
+        luaL_register(L, LUA_COLIBNAME, co_funcs);
+    else
+        luaL_register(L, LUA_COLIBNAME, co_funcs_DEPRECATED);
 
     lua_pushcclosurek(L, coresumey, "resume", 0, coresumecont);
     lua_setfield(L, -2, "resume");
+
+    if (FFlag::LuauCoroutineFinally)
+    {
+        lua_pushcclosurek(L, coclosey, "close", 0, coclosecont);
+        lua_setfield(L, -2, "close");
+    }
 
     // ServerLua: For mimicking sandboxing semantics of `require()`
     lua_pushcclosurek(L, dangerouslyexecuterequiredmodule, "dangerouslyexecuterequiredmodule", 0, dangerouslyexecuterequiredmodulecont);

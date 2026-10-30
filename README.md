@@ -32,19 +32,11 @@ they aren't in SLua-specific code.
 
 ## Building
 
-If building with LSL support, you must first install [`autobuild`](https://github.com/secondlife/autobuild),
-which will pull in the [`tailslide`](https://github.com/secondlife/tailslide) dependency:
-
-```sh
-pipx install autobuild
-autobuild install
-```
-
 On all platforms, you can use CMake to run the following commands to build Luau binaries from source:
 
 ```sh
 mkdir cmake && cd cmake
-cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo  # add '-DLUAU_USE_TAILSLIDE=ON' if you want LSL support.
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build . --target Luau.Repl.CLI --config RelWithDebInfo
 cmake --build . --target Luau.Analyze.CLI --config RelWithDebInfo
 ```
@@ -52,7 +44,7 @@ cmake --build . --target Luau.Analyze.CLI --config RelWithDebInfo
 Alternatively, on Linux and macOS, you can also use `make`:
 
 ```sh
-make config=release luau luau-analyze
+make config=release slua slua-analyze
 ```
 
 To integrate SLua into your CMake application projects as a library, at the minimum, you'll need to depend on `Luau.Compiler` and `Luau.VM` projects. From there you need to create a new Luau state (using Lua 5.x API such as `lua_newstate`), compile source to bytecode and load it into the VM like this:
@@ -68,7 +60,8 @@ if (result == 0)
     return 1; /* return chunk main function */
 ```
 
-For more details about the use of the host API, you currently need to consult [Lua 5.x API](https://www.lua.org/manual/5.1/manual.html#3). Luau closely tracks that API but has a few deviations, such as the need to compile source separately (which is important to be able to deploy VM without a compiler), and the lack of `__gc` support (use `lua_newuserdatadtor` instead).
+For more details about the use of the host API, see the [C API documentation](https://luau.org/api).
+Much of it is similar to the [Lua 5.x API](https://www.lua.org/manual/5.1/manual.html#3), but Luau has a few deviations, such as the need to compile source separately (which is important to be able to deploy VM without a compiler), and the lack of `__gc` support (use `lua_newuserdatadtor` instead).
 
 To gain advantage of many performance improvements, it's highly recommended to use the `safeenv` feature, which sandboxes individual scripts' global tables from each other, and protects builtin libraries from monkey-patching. For this to work, you must call `luaL_sandbox` on the global state and `luaL_sandboxthread` for each new script's execution thread.
 
@@ -84,7 +77,7 @@ SLua uses C++ as its implementation language. The runtime requires C++11, while 
 
 Other than the STL/CRT, SLua library components don't have external dependencies. The test suite depends on the [doctest](https://github.com/onqtam/doctest) testing framework, and the REPL command-line depends on [isocline](https://github.com/daanx/isocline).
 
-Note that LSL support does require that Tailslide be installed, but this is optional.
+LSL support comes from [Tailslide](Tailslide/README.md), which lives in this tree and is always built.
 
 # License
 

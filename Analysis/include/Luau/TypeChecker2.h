@@ -3,15 +3,14 @@
 #pragma once
 
 #include "Luau/Common.h"
-#include "Luau/EqSatSimplification.h"
 #include "Luau/Error.h"
 #include "Luau/Normalize.h"
 #include "Luau/NotNull.h"
 #include "Luau/Subtyping.h"
 #include "Luau/Type.h"
 #include "Luau/TypeFwd.h"
-#include "Luau/TypeOrPack.h"
 #include "Luau/TypeUtils.h"
+#include "Luau/TypeFunction.h"
 
 namespace Luau
 {
@@ -45,7 +44,7 @@ struct Reasonings
         // sort the reasons here to achieve a stable error
         // stringification.
         std::sort(reasons.begin(), reasons.end());
-        std::string allReasons = "\nthis is because ";
+        std::string allReasons = reasons.size() < 2 ? "\n" : "\nthis is because ";
         for (const std::string& reason : reasons)
         {
             if (reasons.size() > 1)
@@ -61,7 +60,6 @@ struct Reasonings
 
 void check(
     NotNull<BuiltinTypes> builtinTypes,
-    NotNull<Simplifier> simplifier,
     NotNull<TypeFunctionRuntime> typeFunctionRuntime,
     NotNull<UnifierSharedState> unifierState,
     NotNull<TypeCheckLimits> limits,
@@ -70,10 +68,16 @@ void check(
     Module* module
 );
 
+enum class AnnotationCheckMode
+{
+    Function,
+    Method,
+    Constructor,
+};
+
 struct TypeChecker2
 {
     NotNull<BuiltinTypes> builtinTypes;
-    NotNull<Simplifier> simplifier;
     NotNull<TypeFunctionRuntime> typeFunctionRuntime;
     DcrLogger* logger;
     const NotNull<TypeCheckLimits> limits;
@@ -85,7 +89,8 @@ struct TypeChecker2
     std::vector<NotNull<Scope>> stack;
     std::vector<TypeId> functionDeclStack;
 
-    DenseHashSet<TypeId> seenTypeFunctionInstances{nullptr};
+    DenseHashSet<TypeId> seenTypeFunctionInstances;
+    TypeFunctionAbsenceCache typeFunctionAbsenceCache;
 
     Normalizer normalizer;
     Subtyping _subtyping;
@@ -93,7 +98,6 @@ struct TypeChecker2
 
     TypeChecker2(
         NotNull<BuiltinTypes> builtinTypes,
-        NotNull<Simplifier> simplifier,
         NotNull<TypeFunctionRuntime> typeFunctionRuntime,
         NotNull<UnifierSharedState> unifierState,
         NotNull<TypeCheckLimits> limits,
@@ -107,6 +111,9 @@ struct TypeChecker2
     Reasonings explainReasonings(TypeId subTy, TypeId superTy, Location location, const SubtypingResult& r);
     Reasonings explainReasonings(TypePackId subTp, TypePackId superTp, Location location, const SubtypingResult& r);
 
+    bool testIsSubtype(TypeId subTy, TypeId superTy, Location location);
+    bool testIsSubtype(TypePackId subTy, TypePackId superTy, Location location);
+
 private:
     static bool allowsNoReturnValues(const TypePackId tp);
     static Location getEndLocation(const AstExprFunction* function);
@@ -117,13 +124,15 @@ private:
     void checkForInternalTypeFunction(TypeId ty, Location location);
     TypeId checkForTypeFunctionInhabitance(TypeId instance, Location location);
     TypePackId lookupPack(AstExpr* expr) const;
+    std::optional<TypeId> tryLookupType(AstExpr* expr);
     TypeId lookupType(AstExpr* expr);
     TypeId lookupAnnotation(AstType* annotation);
     std::optional<TypePackId> lookupPackAnnotation(AstTypePack* annotation) const;
     TypeId lookupExpectedType(AstExpr* expr) const;
     TypePackId lookupExpectedPack(AstExpr* expr, TypeArena& arena) const;
     TypePackId reconstructPack(AstArray<AstExpr*> exprs, TypeArena& arena);
-    Scope* findInnermostScope(Location location) const;
+    // Clip with LuauDontUseInnermostScope
+    Scope* findInnermostScope_DEPRECATED(Location location) const;
     void visit(AstStat* stat);
     void visit(AstStatIf* ifStatement);
     void visit(AstStatWhile* whileStatement);
@@ -139,6 +148,7 @@ private:
     void reportErrorsFromAssigningToNever(AstExpr* lhs, TypeId rhsType);
     void visit(AstStatAssign* assign);
     void visit(AstStatCompoundAssign* stat);
+    void checkFunctionAnnotations(AstExprFunction* func, AnnotationCheckMode mode, Location location);
     void visit(AstStatFunction* stat);
     void visit(AstStatLocalFunction* stat);
     void visit(const AstTypeList* typeList);
@@ -148,12 +158,19 @@ private:
     void visit(AstStatDeclareFunction* stat);
     void visit(AstStatDeclareGlobal* stat);
     void visit(AstStatDeclareExternType* stat);
+    void checkExtendsClause(AstStatClass* stat);
+    void visit(AstStatClass* stat);
+    void visitConstructor(AstStatClass* stat, const AstClassMethod* method);
+    void checkMemberOverrides(AstStatClass* stat);
+    void checkPropertyOverride(AstStatClass* stat, const AstClassProperty* property, const ExternType* superInstanceEtv);
+    void checkMethodOverride(AstStatClass* stat, const AstClassMethod* method, const ExternType* superInstanceEtv);
     void visit(AstStatError* stat);
     void visit(AstExpr* expr, ValueContext context);
     void visit(AstExprGroup* expr, ValueContext context);
     void visit(AstExprConstantNil* expr);
     void visit(AstExprConstantBool* expr);
     void visit(AstExprConstantNumber* expr);
+    void visit(AstExprConstantInteger* expr);
     void visit(AstExprConstantString* expr);
     void visit(AstExprLocal* expr);
     void visit(AstExprGlobal* expr);
@@ -176,6 +193,7 @@ private:
     void visit(AstExprInstantiate* explicitTypeInstantiation);
     void visit(AstExprError* expr);
     TypeId flattenPack(TypePackId pack);
+    void visitTypeArguments(const AstArray<AstTypeOrPack>& typeArguments);
     void visitGenerics(AstArray<AstGenericType*> generics, AstArray<AstGenericTypePack*> genericPacks);
     void visit(AstType* ty);
     void visit(AstTypeReference* ty);
@@ -197,10 +215,8 @@ private:
 
     bool testLiteralOrAstTypeIsSubtype(AstExpr* expr, TypeId expectedType);
 
+    std::optional<bool> testSetMetatableCallIsSubtype(AstExpr* expr, TypeId expectedType);
     bool testPotentialLiteralIsSubtype(AstExpr* expr, TypeId expectedType);
-
-    bool testIsSubtype(TypeId subTy, TypeId superTy, Location location);
-    bool testIsSubtype(TypePackId subTy, TypePackId superTy, Location location);
 
     void maybeReportSubtypingError(TypeId subTy, TypeId superTy, const Location& location);
     // Tests whether subTy is a subtype of superTy in the context of a function iterator for a for-in statement.
@@ -230,7 +246,7 @@ private:
     );
 
     // Avoid duplicate warnings being emitted for the same global variable.
-    DenseHashSet<std::string> warnedGlobals{""};
+    DenseHashSet<std::string> warnedGlobals;
 
     void suggestAnnotations(AstExprFunction* expr, TypeId ty);
 

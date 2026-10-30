@@ -22,10 +22,9 @@
 LUAU_FASTFLAG(DebugLuauMagicTypes)
 
 LUAU_FASTINTVARIABLE(LuauNonStrictTypeCheckerRecursionLimit, 300)
-LUAU_FASTFLAG(LuauEmplaceNotPushBack)
-LUAU_FASTFLAGVARIABLE(LuauUnreducedTypeFunctionsDontTriggerWarnings)
-LUAU_FASTFLAGVARIABLE(LuauNonStrictFetchScopeOnce)
 LUAU_FASTFLAGVARIABLE(LuauAddRecursionCounterToNonStrictTypeChecker)
+LUAU_FASTFLAG(LuauTypeFunctionsAbsenceCache)
+LUAU_FASTFLAG(DebugLuauUserDefinedClasses)
 
 namespace Luau
 {
@@ -43,10 +42,7 @@ struct StackPusher
         : stack(&stack)
         , scope(scope)
     {
-        if (FFlag::LuauEmplaceNotPushBack)
-            stack.emplace_back(scope);
-        else
-            stack.push_back(NotNull{scope});
+        stack.emplace_back(scope);
     }
 
     ~StackPusher()
@@ -166,7 +162,6 @@ private:
 struct NonStrictTypeChecker
 {
     NotNull<BuiltinTypes> builtinTypes;
-    NotNull<Simplifier> simplifier;
     NotNull<TypeFunctionRuntime> typeFunctionRuntime;
     const NotNull<InternalErrorReporter> ice;
     NotNull<TypeArena> arena;
@@ -174,16 +169,16 @@ struct NonStrictTypeChecker
     Normalizer normalizer;
     Subtyping subtyping;
     NotNull<const DataFlowGraph> dfg;
-    DenseHashSet<TypeId> noTypeFunctionErrors{nullptr};
+    DenseHashSet<TypeId> noTypeFunctionErrors;
+    TypeFunctionAbsenceCache typeFunctionAbsenceCache;
     std::vector<NotNull<Scope>> stack;
-    DenseHashMap<TypeId, TypeId> cachedNegations{nullptr};
+    DenseHashMap<TypeId, TypeId> cachedNegations;
 
     const NotNull<TypeCheckLimits> limits;
 
     NonStrictTypeChecker(
         NotNull<TypeArena> arena,
         NotNull<BuiltinTypes> builtinTypes,
-        NotNull<Simplifier> simplifier,
         NotNull<TypeFunctionRuntime> typeFunctionRuntime,
         const NotNull<InternalErrorReporter> ice,
         NotNull<UnifierSharedState> unifierState,
@@ -192,13 +187,12 @@ struct NonStrictTypeChecker
         Module* module
     )
         : builtinTypes(builtinTypes)
-        , simplifier(simplifier)
         , typeFunctionRuntime(typeFunctionRuntime)
         , ice(ice)
         , arena(arena)
         , module(module)
         , normalizer{arena, builtinTypes, unifierState, SolverMode::New, /* cache inhabitance */ true}
-        , subtyping{builtinTypes, arena, simplifier, NotNull(&normalizer), typeFunctionRuntime, ice}
+        , subtyping{builtinTypes, arena, NotNull(&normalizer), typeFunctionRuntime, ice}
         , dfg(dfg)
         , limits(limits)
     {
@@ -211,6 +205,19 @@ struct NonStrictTypeChecker
         else
             return std::nullopt;
     }
+
+    void visitTypeArguments(const AstArray<AstTypeOrPack>& typeArguments)
+    {
+        for (const AstTypeOrPack& typeArgument : typeArguments)
+        {
+            LUAU_ASSERT(typeArgument.type || typeArgument.typePack);
+            if (typeArgument.type)
+                visit(typeArgument.type);
+            else
+                visit(typeArgument.typePack);
+        }
+    }
+
 
     TypeId flattenPack(TypePackId pack)
     {
@@ -243,8 +250,11 @@ struct NonStrictTypeChecker
         if (noTypeFunctionErrors.find(instance))
             return instance;
 
-        TypeFunctionContext context{arena, builtinTypes, stack.back(), simplifier, NotNull{&normalizer}, typeFunctionRuntime, ice, limits};
-        ErrorVec errors = reduceTypeFunctions(instance, location, NotNull{&context}, true).errors;
+        TypeFunctionContext context{arena, builtinTypes, stack.back(), NotNull{&normalizer}, typeFunctionRuntime, ice, limits, NotNull{&subtyping}};
+        ErrorVec errors = reduceTypeFunctions(
+                              instance, location, NotNull{&context}, true, FFlag::LuauTypeFunctionsAbsenceCache ? &typeFunctionAbsenceCache : nullptr
+        )
+                              .errors;
 
         if (errors.empty())
             noTypeFunctionErrors.insert(instance);
@@ -309,6 +319,8 @@ struct NonStrictTypeChecker
         else if (auto s = stat->as<AstStatDeclareGlobal>())
             return visit(s);
         else if (auto s = stat->as<AstStatDeclareExternType>())
+            return visit(s);
+        else if (auto s = stat->as<AstStatClass>())
             return visit(s);
         else if (auto s = stat->as<AstStatError>())
             return visit(s);
@@ -510,6 +522,81 @@ struct NonStrictTypeChecker
         return {};
     }
 
+    NonStrictContext visit(AstStatClass* declClass)
+    {
+        LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses);
+
+        for (auto prop : declClass->members)
+        {
+            Luau::visit(
+                overloaded{
+                    [&](const AstClassProperty& classProp)
+                    {
+                        visit(classProp.ty);
+                    },
+                    [&](const AstClassMethod& method)
+                    {
+                        visit(method.function);
+                    }
+                },
+                prop
+            );
+        }
+
+        if (declClass->super)
+        {
+            // Subtlety: The extends clause names an expression, so the type of this
+            // expression will be the class object, not the instance type that we're
+            // inheriting from.
+            const ExternType* superInstanceEtv = getClassInstanceType(lookupType(declClass->super));
+            if (!superInstanceEtv)
+                return {};
+
+            for (auto prop : declClass->members)
+            {
+                if (auto property = get_if<AstClassProperty>(&prop))
+                {
+                    Name propName = Name{property->name.value};
+                    // Slightly inefficient: we walk the inheritance chain for each property
+                    for (const ExternType* curr = superInstanceEtv; curr; curr = get<ExternType>(follow(curr->parent)))
+                    {
+                        if (curr->props.count(propName) != 0)
+                        {
+                            reportError(
+                                IllegalClassPropertyOverride{propName, Name{declClass->name->name.value}, Name{curr->name}}, property->nameLocation
+                            );
+                            break;
+                        }
+                    }
+                }
+                else if (auto method = get_if<AstClassMethod>(&prop);
+                         method && (method->functionName == "__eq" || method->functionName == "__lt" || method->functionName == "__le"))
+                {
+                    Name methodName = Name{method->functionName.value};
+                    for (const ExternType* curr = superInstanceEtv; curr; curr = get<ExternType>(follow(curr->parent)))
+                    {
+                        if (curr->metatable)
+                        {
+                            if (const TableType* mt = get<TableType>(follow(*curr->metatable)))
+                            {
+                                if (mt->props.count(methodName) != 0)
+                                {
+                                    reportError(
+                                        IncompatibleClassMethodOverride{methodName, Name{declClass->name->name.value}, Name{curr->name}},
+                                        method->nameLocation
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return {};
+    }
+
     NonStrictContext visit(AstStatError* error)
     {
         for (AstStat* stat : error->statements)
@@ -538,6 +625,8 @@ struct NonStrictTypeChecker
         else if (auto e = expr->as<AstExprConstantBool>())
             return visit(e);
         else if (auto e = expr->as<AstExprConstantNumber>())
+            return visit(e);
+        else if (auto e = expr->as<AstExprConstantInteger>())
             return visit(e);
         else if (auto e = expr->as<AstExprConstantString>())
             return visit(e);
@@ -569,6 +658,8 @@ struct NonStrictTypeChecker
             return visit(e);
         else if (auto e = expr->as<AstExprError>())
             return visit(e);
+        else if (auto e = expr->as<AstExprInstantiate>())
+            return visit(e);
         else
         {
             LUAU_ASSERT(!"NonStrictTypeChecker encountered an unknown expression type");
@@ -592,6 +683,11 @@ struct NonStrictTypeChecker
     }
 
     NonStrictContext visit(AstExprConstantNumber* expr)
+    {
+        return {};
+    }
+
+    NonStrictContext visit(AstExprConstantInteger* expr)
     {
         return {};
     }
@@ -629,6 +725,7 @@ struct NonStrictTypeChecker
     NonStrictContext visit(AstExprCall* call)
     {
         visit(call->func, ValueContext::RValue);
+        visitTypeArguments(call->typeArguments);
         for (auto arg : call->args)
             visit(arg, ValueContext::RValue);
 
@@ -714,42 +811,15 @@ struct NonStrictTypeChecker
             }
 
             // Populate the context and now iterate through each of the arguments to the call to find out if we satisfy the types
-            if (FFlag::LuauNonStrictFetchScopeOnce)
+            NotNull<Scope> scope{findInnermostScope(call->location)};
+            for (size_t i = 0; i < arguments.size(); i++)
             {
-                NotNull<Scope> scope{findInnermostScope(call->location)};
-                for (size_t i = 0; i < arguments.size(); i++)
+                AstExpr* arg = arguments[i];
+                if (auto runTimeFailureType = willRunTimeError(arg, fresh, scope))
                 {
-                    AstExpr* arg = arguments[i];
-                    if (auto runTimeFailureType = willRunTimeError(arg, fresh, scope))
-                    {
-                        if (FFlag::LuauUnreducedTypeFunctionsDontTriggerWarnings)
-                            reportError(CheckedFunctionCallError{argTypes[i], *runTimeFailureType, functionName, i}, arg->location);
-                        else
-                        {
-                            if (!get<NeverType>(follow(*runTimeFailureType)))
-                                reportError(CheckedFunctionCallError{argTypes[i], *runTimeFailureType, functionName, i}, arg->location);
-                        }
-                    }
+                    reportError(CheckedFunctionCallError{argTypes[i], *runTimeFailureType, functionName, i}, arg->location);
                 }
             }
-            else
-            {
-                for (size_t i = 0; i < arguments.size(); i++)
-                {
-                    AstExpr* arg = arguments[i];
-                    if (auto runTimeFailureType = willRunTimeError_DEPRECATED(arg, fresh))
-                    {
-                        if (FFlag::LuauUnreducedTypeFunctionsDontTriggerWarnings)
-                            reportError(CheckedFunctionCallError{argTypes[i], *runTimeFailureType, functionName, i}, arg->location);
-                        else
-                        {
-                            if (!get<NeverType>(follow(*runTimeFailureType)))
-                                reportError(CheckedFunctionCallError{argTypes[i], *runTimeFailureType, functionName, i}, arg->location);
-                        }
-                    }
-                }
-            }
-
             if (arguments.size() < argTypes.size())
             {
                 // We are passing fewer arguments than we expect
@@ -787,34 +857,17 @@ struct NonStrictTypeChecker
         // TODO: should a function being used as an expression generate a context without the arguments?
         auto pusher = pushStack(exprFn);
         NonStrictContext remainder = visit(exprFn->body);
-        if (FFlag::LuauNonStrictFetchScopeOnce)
+        auto scope = pusher ? pusher->scope : NotNull{module->getModuleScope().get()};
+        for (AstLocal* local : exprFn->args)
         {
-            auto scope = pusher ? pusher->scope : NotNull{module->getModuleScope().get()};
-            for (AstLocal* local : exprFn->args)
+            if (std::optional<TypeId> ty = willRunTimeErrorFunctionDefinition(local, scope, remainder))
             {
-                if (std::optional<TypeId> ty = willRunTimeErrorFunctionDefinition(local, scope, remainder))
-                {
-                    const char* debugname = exprFn->debugname.value;
-                    reportError(NonStrictFunctionDefinitionError{debugname ? debugname : "", local->name.value, *ty}, local->location);
-                }
-                remainder.remove(dfg->getDef(local));
-
-                visit(local->annotation);
+                const char* debugname = exprFn->debugname.value;
+                reportError(NonStrictFunctionDefinitionError{debugname ? debugname : "", local->name.value, *ty}, local->location);
             }
-        }
-        else
-        {
-            for (AstLocal* local : exprFn->args)
-            {
-                if (std::optional<TypeId> ty = willRunTimeErrorFunctionDefinition_DEPRECATED(local, remainder))
-                {
-                    const char* debugname = exprFn->debugname.value;
-                    reportError(NonStrictFunctionDefinitionError{debugname ? debugname : "", local->name.value, *ty}, local->location);
-                }
-                remainder.remove(dfg->getDef(local));
+            remainder.remove(dfg->getDef(local));
 
-                visit(local->annotation);
-            }
+            visit(local->annotation);
         }
         visitGenerics(exprFn->generics, exprFn->genericPacks);
 
@@ -889,6 +942,13 @@ struct NonStrictTypeChecker
         return {};
     }
 
+    NonStrictContext visit(AstExprInstantiate* instantiate)
+    {
+        visitTypeArguments(instantiate->typeArguments);
+
+        return visit(instantiate->expr, ValueContext::RValue);
+    }
+
     void visit(AstType* ty)
     {
         // If this node is `nullptr`, early exit.
@@ -944,6 +1004,13 @@ struct NonStrictTypeChecker
 
         if (alias.has_value())
         {
+            // Generic defaults should be resolved before the corresponding type parameter is added to the alias scope.
+            // At this point however, the parameter is present in the scope because of how `ConstraintGenerator` is set up.
+            // As a result, we can't use `scope->lookupType` to check for the existence of the type, because it will find
+            // the parameter incorrectly, and thus accept a self-referece as a default value.
+            if (!ty->prefix && module->astTypeReferenceLookupFailures.contains(ty))
+                return reportError(UnknownSymbol{ty->name.value, UnknownSymbol::Context::Type}, ty->location);
+
             size_t typesRequired = alias->typeParams.size();
             size_t packsRequired = alias->typePackParams.size();
 
@@ -1145,7 +1212,16 @@ struct NonStrictTypeChecker
         LUAU_ASSERT(scope);
 
         if (std::optional<TypePackId> alias = scope->lookupPack(tp->genericName.value))
+        {
+            // Generic defaults should be resolved before the corresponding type parameter is added to the alias scope.
+            // At this point however, the parameter is present in the scope because of how `ConstraintGenerator` is set up.
+            // As a result, we can't use `scope->lookupPack` to check for the existence of the type pack, because it will find
+            // the parameter incorrectly, and thus accept a self-referece as a default value.
+            if (module->astTypePackReferenceLookupFailures.contains(tp))
+                return reportError(UnknownSymbol{tp->genericName.value, UnknownSymbol::Context::Type}, tp->location);
+
             return;
+        }
 
         if (scope->lookupType(tp->genericName.value))
             return reportError(
@@ -1161,7 +1237,7 @@ struct NonStrictTypeChecker
 
     void visitGenerics(AstArray<AstGenericType*> generics, AstArray<AstGenericTypePack*> genericPacks)
     {
-        DenseHashSet<AstName> seen{AstName{}};
+        DenseHashSet<AstName> seen;
 
         for (const auto* g : generics)
         {
@@ -1233,39 +1309,15 @@ struct NonStrictTypeChecker
             {
 
                 TypeId actualType = lookupType(fragment);
-                if (FFlag::LuauUnreducedTypeFunctionsDontTriggerWarnings && shouldSkipRuntimeErrorTesting(actualType))
+                if (shouldSkipRuntimeErrorTesting(actualType))
                     continue;
                 SubtypingResult r = subtyping.isSubtype(actualType, *contextTy, scope);
                 if (r.normalizationTooComplex)
                     reportError(NormalizationTooComplex{}, fragment->location);
-                if (r.isSubtype)
-                    return {actualType};
-            }
-        }
-
-        return {};
-    }
-
-    // If this fragment of the ast will run time error, return the type that causes this
-    // Clip with LuauNonStrictFetchScopeOnce
-    std::optional<TypeId> willRunTimeError_DEPRECATED(AstExpr* fragment, const NonStrictContext& context)
-    {
-        NotNull<Scope> scope{Luau::findScopeAtPosition(*module, fragment->location.end).get()};
-        DefId def = dfg->getDef(fragment);
-        std::vector<DefId> defs;
-        collectOperands(def, &defs);
-        for (DefId def : defs)
-        {
-            if (std::optional<TypeId> contextTy = context.find(def))
-            {
-
-                TypeId actualType = lookupType(fragment);
-                if (FFlag::LuauUnreducedTypeFunctionsDontTriggerWarnings && shouldSkipRuntimeErrorTesting(actualType))
-                    continue;
-                SubtypingResult r = subtyping.isSubtype(actualType, *contextTy, scope);
-                if (r.normalizationTooComplex)
-                    reportError(NormalizationTooComplex{}, fragment->location);
-                if (r.isSubtype)
+                // If this subtype test passed and we did not see an error
+                // suppressing bit, then return this as the type that will
+                // error at runtime.
+                if (r.isSubtype && !r.isErrorSuppressing)
                     return {actualType};
             }
         }
@@ -1275,29 +1327,6 @@ struct NonStrictTypeChecker
 
     std::optional<TypeId> willRunTimeErrorFunctionDefinition(AstLocal* fragment, NotNull<Scope> scope, const NonStrictContext& context)
     {
-        DefId def = dfg->getDef(fragment);
-        std::vector<DefId> defs;
-        collectOperands(def, &defs);
-        for (DefId def : defs)
-        {
-            if (std::optional<TypeId> contextTy = context.find(def))
-            {
-                SubtypingResult r1 = subtyping.isSubtype(builtinTypes->unknownType, *contextTy, scope);
-                SubtypingResult r2 = subtyping.isSubtype(*contextTy, builtinTypes->unknownType, scope);
-                if (r1.normalizationTooComplex || r2.normalizationTooComplex)
-                    reportError(NormalizationTooComplex{}, fragment->location);
-                bool isUnknown = r1.isSubtype && r2.isSubtype;
-                if (isUnknown)
-                    return {builtinTypes->unknownType};
-            }
-        }
-        return {};
-    }
-
-    // Clip with LuauNonStrictFetchScopeOnce
-    std::optional<TypeId> willRunTimeErrorFunctionDefinition_DEPRECATED(AstLocal* fragment, const NonStrictContext& context)
-    {
-        NotNull<Scope> scope{Luau::findScopeAtPosition(*module, fragment->location.end).get()};
         DefId def = dfg->getDef(fragment);
         std::vector<DefId> defs;
         collectOperands(def, &defs);
@@ -1337,7 +1366,6 @@ private:
 
 void checkNonStrict(
     NotNull<BuiltinTypes> builtinTypes,
-    NotNull<Simplifier> simplifier,
     NotNull<TypeFunctionRuntime> typeFunctionRuntime,
     NotNull<InternalErrorReporter> ice,
     NotNull<UnifierSharedState> unifierState,
@@ -1349,9 +1377,7 @@ void checkNonStrict(
 {
     LUAU_TIMETRACE_SCOPE("checkNonStrict", "Typechecking");
 
-    NonStrictTypeChecker typeChecker{
-        NotNull{&module->internalTypes}, builtinTypes, simplifier, typeFunctionRuntime, ice, unifierState, dfg, limits, module
-    };
+    NonStrictTypeChecker typeChecker{NotNull{module->internalTypes.get()}, builtinTypes, typeFunctionRuntime, ice, unifierState, dfg, limits, module};
     typeChecker.visit(sourceModule.root);
     unfreeze(module->interfaceTypes);
     copyErrors(module->errors, module->interfaceTypes, builtinTypes);
@@ -1364,9 +1390,9 @@ void checkNonStrict(
             {
                 return get<UnknownRequire>(err) != nullptr;
             }
-            ),
+        ),
         module->errors.end()
-        );
+    );
 
     freeze(module->interfaceTypes);
 }

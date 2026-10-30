@@ -7,91 +7,43 @@
     <string>autobuild</string>
     <key>installables</key>
     <map>
-      <key>tailslide</key>
+      <key>lsl_definitions</key>
       <map>
         <key>platforms</key>
         <map>
-          <key>darwin64</key>
+          <key>common</key>
           <map>
             <key>archive</key>
             <map>
               <key>hash</key>
-              <string>e08633020943497f1245fcff2068dd7339a4b937</string>
+              <string>ee962c0f22d507568d9db9e4720b813f264642bb</string>
               <key>hash_algorithm</key>
               <string>sha1</string>
               <key>url</key>
-              <string>https://github.com/secondlife/tailslide/releases/download/v1.5.8/tailslide-1.5.8-darwin64-20186111034.tar.zst</string>
+              <string>https://github.com/secondlife/lsl-definitions/releases/download/v0.7.0/lsl_definitions-0.7.0-common-34724367572.tar.zst</string>
             </map>
             <key>name</key>
-            <string>darwin64</string>
-          </map>
-          <key>linux</key>
-          <map>
-            <key>archive</key>
-            <map>
-              <key>hash</key>
-              <string>3a1b998bc65c65d96fee900f8698881d499f64eb</string>
-              <key>hash_algorithm</key>
-              <string>sha1</string>
-              <key>url</key>
-              <string>https://github.com/secondlife/tailslide/releases/download/v1.5.8/tailslide-1.5.8-linux-20186111034.tar.zst</string>
-            </map>
-            <key>name</key>
-            <string>linux</string>
-          </map>
-          <key>linux64</key>
-          <map>
-            <key>archive</key>
-            <map>
-              <key>hash</key>
-              <string>002c70a435e934b7404da74bf4e529828c3f976f</string>
-              <key>hash_algorithm</key>
-              <string>sha1</string>
-              <key>url</key>
-              <string>https://github.com/secondlife/tailslide/releases/download/v1.5.8/tailslide-1.5.8-linux64-20186111034.tar.zst</string>
-            </map>
-            <key>name</key>
-            <string>linux64</string>
-          </map>
-          <key>windows64</key>
-          <map>
-            <key>archive</key>
-            <map>
-              <key>hash</key>
-              <string>afb69ef491aaf2ad29b8def26b518021cffabb80</string>
-              <key>hash_algorithm</key>
-              <string>sha1</string>
-              <key>url</key>
-              <string>https://github.com/secondlife/tailslide/releases/download/v1.5.8/tailslide-1.5.8-windows64-20186111034.tar.zst</string>
-            </map>
-            <key>name</key>
-            <string>windows64</string>
+            <string>common</string>
           </map>
         </map>
         <key>license</key>
         <string>MIT</string>
         <key>license_file</key>
-        <string>LICENSES/tailslide.txt</string>
+        <string>LICENSES/lsl_definitions.txt</string>
         <key>copyright</key>
-        <string>You may copy it</string>
+        <string>Copyright (c) 2026, Linden Research, Inc.</string>
         <key>version</key>
-        <string>1.5.8</string>
+        <string>0.7.0</string>
         <key>use_scm_version</key>
         <boolean>true</boolean>
         <key>name</key>
-        <string>tailslide</string>
-        <key>vcs_branch</key>
-        <string>HEAD</string>
-        <key>vcs_revision</key>
-        <string>65a76b90a20d92ad6b64ded75ebdaa5432fea8b0</string>
-        <key>vcs_url</key>
-        <string>https://github.com/SaladDais/tailslide</string>
-        <key>canonical_repo</key>
-        <string>https://github.com/SaladDais/tailslide</string>
-        <key>description</key>
-        <string>Embeddable parser, AST, tree walker and compiler for the Linden Scripting Language based on LSLint</string>
+        <string>lsl_definitions</string>
         <key>source_type</key>
         <string>git</string>
+        <key>canonical_repo</key>
+        <string>https://github.com/secondlife/lsl-definitions</string>
+        <key>description</key>
+        <string>LSL definitions</string>
       </map>
     </map>
     <key>package_description</key>
@@ -120,6 +72,7 @@
           <key>manifest</key>
           <array>
             <string>LICENSES/luau.txt</string>
+            <string>LICENSES/tailslide.txt</string>
             <string>include</string>
           </array>
           <key>build_directory</key>
@@ -142,6 +95,7 @@
           <key>manifest</key>
           <array>
             <string>lib</string>
+            <string>bin</string>
           </array>
           <key>name</key>
           <string>darwin</string>
@@ -215,7 +169,7 @@
       <key>license_file</key>
       <string>LICENSES/luau.txt</string>
       <key>copyright</key>
-      <string>Copyright (c) 2024 Linden Lab Inc., Copyright (c) 2022-2024 Harold Cindy, Copyright (c) 2019-2024 Roblox Corporation, Copyright (c) 1994–2019 Lua.org, PUC-Rio.</string>
+      <string>Copyright (c) 2024 Linden Research, Inc., Copyright (c) 2022-2024 Harold Cindy, Copyright (c) 2019-2024 Roblox Corporation, Copyright (c) 1994–2019 Lua.org, PUC-Rio.</string>
       <key>use_scm_version</key>
       <boolean>true</boolean>
       <key>name</key>

@@ -7,6 +7,7 @@
 #include "ltable.h"
 #include "lapi.h"
 #include "llsl.h"
+#include "lstrbuf.h"
 #include "mono_strings.h"
 #include "lgcgraph.h"
 
@@ -104,10 +105,11 @@ static RangeExtractionInfo _calc_extraction_range(
         // Select items where (i <= end || i >= start)
         // This gives us: [0, end] + [start, obj_len-1]
 
-        // Check if we want the whole object
+        // Check if we want the whole object. The difference can exceed INT_MAX
+        // once a negative end index has been rebased on the length.
         if (end_idx >= obj_len
             || start_idx <= 0
-            || start_idx - end_idx <= 1)
+            || (int64_t)start_idx - end_idx <= 1)
         {
             result.whole_object = true;
             return result;
@@ -172,7 +174,7 @@ static int _list_accessor_helper(lua_State *L, LSLIType type)
     if (idx < len && idx >= 0)
     {
         lua_pushcfunction(L, lsl_cast_list_elem, "lsl_cast_list_elem");
-        luaA_pushobject(L, &h->array[idx]);
+        luaA_pushvalue(L, &h->array[idx]);
         luaSL_pushinteger(L, type);
         lua_call(L, 2, 1);
         // If cast failed, get rid of the value and return the default.
@@ -213,10 +215,41 @@ static int ll_list2float(lua_State *L)
     return 1;
 }
 
+static constexpr uint8_t NULL_KEY_BYTES[16] = {0};
+
+// Push the error key for the particular VM type we're using.
+// Blank string for LSL, null UUID for Lua.
+static void push_error_key(lua_State *L)
+{
+    if (LUAU_IS_LSL_VM(L))
+        luaSL_pushuuidstring(L, "");
+    else
+        luaSL_pushuuidbytes(L, NULL_KEY_BYTES);
+}
+
 static int ll_list2key(lua_State *L)
 {
     if (!_list_accessor_helper(L, LSLIType::LST_KEY))
-        luaSL_pushuuidstring(L, "");
+    {
+        push_error_key(L);
+        return 1;
+    }
+    // In SLua mode, reject uncompressed (invalid) UUIDs and return NULL_KEY
+    if (!LUAU_IS_LSL_VM(L))
+    {
+        if (lua_isnil(L, -1))
+        {
+            lua_pop(L, 1);
+            push_error_key(L);
+        }
+        else
+        {
+            bool compressed;
+            luaSL_checkuuid(L, -1, &compressed);
+            if (!compressed)
+                push_error_key(L);
+        }
+    }
     return 1;
 }
 
@@ -235,7 +268,7 @@ static int ll_list2vector(lua_State *L)
         auto *tv = &h->array[idx];
         if (lua_lsl_type(tv) == (uint8_t)LSLIType::LST_VECTOR)
         {
-            luaA_pushobject(L, tv);
+            luaA_pushvalue(L, tv);
             return 1;
         }
     }
@@ -258,7 +291,7 @@ static int ll_list2rot(lua_State *L)
         auto *tv = &h->array[idx];
         if (lua_lsl_type(tv) == (uint8_t)LSLIType::LST_QUATERNION)
         {
-            luaA_pushobject(L, tv);
+            luaA_pushvalue(L, tv);
             return 1;
         }
     }
@@ -277,16 +310,16 @@ static int ll_getlistentrytype(lua_State *L)
     int idx = _checkobjectindex(L, len, 2, compat_mode);
     if (idx < len && idx >= 0)
     {
-        luaSL_pushinteger(L, lua_lsl_type(&h->array[idx]));
+        luaSL_pushnativeinteger(L, lua_lsl_type(&h->array[idx]));
         return 1;
     }
-    luaSL_pushinteger(L, 0);
+    luaSL_pushnativeinteger(L, 0);
     return 1;
 }
 
 static int ll_list2list(lua_State *L)
 {
-    lua_checkstack(L, 5);
+    luaL_checkstack(L, 5, "list conversion");
 
     luaL_checktype(L, 1, LUA_TTABLE);
     auto *h = hvalue(luaA_toobject(L, 1));
@@ -316,7 +349,7 @@ static int ll_list2list(lua_State *L)
         // Cloning is important in case lists are ever mutable
         TValue new_tv;
         sethvalue(L, &new_tv, luaH_clone(L, h));
-        luaA_pushobject(L, &new_tv);
+        luaA_pushvalue(L, &new_tv);
         return 1;
     }
 
@@ -359,6 +392,7 @@ static int ll_dumplist2string(lua_State *L)
 {
     luaL_checktype(L, 1, LUA_TTABLE);
     luaL_checktype(L, 2, LUA_TSTRING);
+    lua_settop(L, 2);
     auto *h = hvalue(luaA_toobject(L, 1));
     int len = luaH_getn(h);
 
@@ -368,45 +402,41 @@ static int ll_dumplist2string(lua_State *L)
         return 1;
     }
 
-    lua_checkstack(L, 4);
+    const char *sep = nullptr;
+    size_t sep_size = 0;
+    sep = lua_tolstring(L, 2, &sep_size);
 
-    // Assume at least 1 character per item + separator length for our initial capacity.
-    // This is essentially a minimum but gets us in the right ballpark without counting everything
-    // StringBuilder will allocate more as needed.
-    // Set the max capacity to 64k (the max script size) + a little slop.
-    static const int max_size = 65 * 1024;
-    bool first = true;
-    lua_pushstring(L, "");
+    luaL_checkstack(L, 5, "list dump");
+
+    auto *strbuf = luaYB_push(L);
     for(int i=0; i<len; ++i)
     {
-        if (first)
-            lua_pushstring(L, "");
-        else
-            lua_pushvalue(L, 2);
-        first = false;
+        if (i != 0)
+        {
+            luaYB_appendmem(L, strbuf, sep, sep_size);
+        }
 
         // Unlike (string)list_val, this doesn't keep negative zero.
         lua_pushcfunction(L, lsl_cast_list_elem_poszero, "lsl_cast_list_elem_poszero");
-        luaA_pushobject(L, &h->array[i]);
+        luaA_pushvalue(L, &h->array[i]);
         luaSL_pushinteger(L, LSLIType::LST_STRING);
         lua_call(L, 2, 1);
         // But we might have a type we don't understand in the list
         if (lua_type(L, -1) == LUA_TNIL)
             luaL_errorL(L, "non-LSL value in list");
 
-        lua_concat(L, 3);
-        if (lua_strlen(L, 3) > max_size)
-        {
-            luaD_throw(L, LUA_ERRMEM);
-        }
+        luaYB_addvalue(L, strbuf);
     }
 
+    // Atomically replace the string buffer on the stack with its new TString equivalent
+    lua_settop(L, 3);
+    luaYB_tostring(L, 3, true);
     return 1;
 }
 
 static int ll_deletesublist(lua_State *L)
 {
-    lua_checkstack(L, 4);
+    luaL_checkstack(L, 4, "list slice");
 
     luaL_checktype(L, 1, LUA_TTABLE);
     auto *h = hvalue(luaA_toobject(L, 1));
@@ -430,7 +460,7 @@ static int ll_deletesublist(lua_State *L)
         // Cloning is important in case lists are ever mutable
         TValue new_tv;
         sethvalue(L, &new_tv, luaH_clone(L, h));
-        luaA_pushobject(L, &new_tv);
+        luaA_pushvalue(L, &new_tv);
         return 1;
     }
 
@@ -483,7 +513,7 @@ static int ll_deletesublist(lua_State *L)
 
 static int ll_listinsertlist(lua_State *L)
 {
-    lua_checkstack(L, 4);
+    luaL_checkstack(L, 4, "list insert");
 
     luaL_checktype(L, 1, LUA_TTABLE);
     auto * dest_h = hvalue(luaA_toobject(L, 1));
@@ -513,7 +543,7 @@ static int ll_listinsertlist(lua_State *L)
     if (cloned_h != nullptr)
     {
         sethvalue(L, &new_tv, cloned_h);
-        luaA_pushobject(L, &new_tv);
+        luaA_pushvalue(L, &new_tv);
         return 1;
     }
 
@@ -549,13 +579,14 @@ static int ll_listinsertlist(lua_State *L)
 
 static int ll_listreplacelist(lua_State *L)
 {
-    lua_checkstack(L, 5);
+    luaL_checkstack(L, 5, "list replace");
 
     luaL_checktype(L, 1, LUA_TTABLE);
     luaL_checktype(L, 2, LUA_TTABLE);
     int orig_len = lua_objlen(L, 1);
+    bool compat_mode = lua_toboolean(L, lua_upvalueindex(1));
     // Let llDeleteSubList handle the tricky part.
-    lua_pushboolean(L, true);
+    lua_pushboolean(L, compat_mode);
     lua_pushcclosurek(L, ll_deletesublist, "DeleteSubList", 1, nullptr);
     lua_pushvalue(L, 1);
     lua_pushvalue(L, 3);
@@ -569,8 +600,6 @@ static int ll_listreplacelist(lua_State *L)
 
     auto *src_h = hvalue(luaA_toobject(L, 2));
     int src_len = luaH_getn(src_h);
-
-    bool compat_mode = lua_toboolean(L, lua_upvalueindex(1));
 
     int target = _checkobjectindex(L, orig_len, 3, compat_mode);
 
@@ -592,7 +621,7 @@ static int ll_listreplacelist(lua_State *L)
     if (cloned_h)
     {
         sethvalue(L, &new_tv, cloned_h);
-        luaA_pushobject(L, &new_tv);
+        luaA_pushvalue(L, &new_tv);
         return 1;
     }
 
@@ -867,6 +896,9 @@ static const luaL_Reg lllib[] = {
     {"ToLower", ll_to_lower},
     {"ToUpper", ll_to_upper},
     {"GetTime", ll_get_time},
+    {"Rot2Fwd", lua_quaternion_tofwd},
+    {"Rot2Left", lua_quaternion_toleft},
+    {"Rot2Up", lua_quaternion_toup},
     {NULL, NULL},
 };
 
@@ -967,26 +999,17 @@ static int ll_sleep(lua_State *)
     return 0;
 }
 
+// Test stub: does not include bytecode size the way the real server-side
+// implementation does, so only meaningful for diffing values within a test.
 static int ll_getusedmemory(lua_State* L)
 {
-    luaC_fullgc(L);
-    int total_size = lua_totalmemoverhead(L);
-
-    FILE* f = fopen("/tmp/memdump.json", "w");
-    LUAU_ASSERT(f);
-
-    luaC_dump(L, f, nullptr);
-
-    fclose(f);
-    lua_pushnumber(L, lua_totalbytes(L, 2));
+    luaSL_pushnativeinteger(L, (int)lua_userthreadgc(L, nullptr));
     return 1;
 }
 
 static int ll_getfreememory(lua_State *L)
 {
-    luaC_fullgc(L);
-    luaX_graphheap(L, "/tmp/whatever.json");
-    luaSL_pushnativeinteger(L, (int)lua_userthreadsize(L, nullptr));
+    luaSL_pushnativeinteger(L, 0x7FFffFF);
     return 1;
 }
 

@@ -33,7 +33,6 @@ struct BuiltinTypeFunctions
 
     TypeFunction ltFunc;
     TypeFunction leFunc;
-    TypeFunction eqFunc;
 
     TypeFunction refineFunc;
     TypeFunction singletonFunc;
@@ -47,6 +46,8 @@ struct BuiltinTypeFunctions
 
     TypeFunction setmetatableFunc;
     TypeFunction getmetatableFunc;
+
+    TypeFunction objectofFunc;
 
     TypeFunction weakoptionalFunc;
 

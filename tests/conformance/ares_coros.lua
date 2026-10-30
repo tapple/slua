@@ -1,5 +1,5 @@
-local perms = {[coroutine.yield]="yield", [coroutine.wrap]="wrap", [coroutine.resume]="resume", [assert]="assert"}
-local uperms = {yield=coroutine.yield, wrap=coroutine.wrap, resume=coroutine.resume, assert=assert}
+local perms = {[coroutine.yield]="yield", [coroutine.wrap]="wrap", [coroutine.resume]="resume", [assert]="assert", [table.create]="table.create", [unpack]="unpack", [error]="error"}
+local uperms = {yield=coroutine.yield, wrap=coroutine.wrap, resume=coroutine.resume, assert=assert, ["table.create"]=table.create, unpack=unpack, error=error}
 
 
 -- so we can run these tests with eris too
@@ -60,6 +60,15 @@ assert(coroutine.status(new_setter) == 'dead')
 local unpersisted_dead = ares.unpersist(uperms, ares.persist(perms, new_yielder))
 assert(coroutine.status(unpersisted_dead) == 'dead')
 assert(coroutine.resume(unpersisted_dead) == false)
+
+-- a coroutine that died to an error keeps a status other than ok or suspended
+local errored = coroutine.create(function() error("boom") end)
+assert(coroutine.resume(errored) == false)
+assert(coroutine.status(errored) == 'dead')
+
+local unpersisted_errored = ares.unpersist(uperms, ares.persist(perms, errored))
+assert(coroutine.status(unpersisted_errored) == 'dead')
+assert(coroutine.resume(unpersisted_errored) == false)
 
 -- this coroutine should be able to pick up where it left off
 assert(coroutine.status(unpersisted_mid_execution) == 'suspended')
@@ -143,6 +152,81 @@ assert(tabs[2] == rtabs[2])
 assert(tabs[3] == rtabs[3])
 assert(tabs[3].one == rtabs[3].one)
 assert(tabs[2].three == rtabs[2].three)
+
+-- open upvalue patching: closure on the stack (not executing) at yield time
+-- Regression test: p_thread's open upvalue section must use the same reftable key
+-- as p_closure so u_thread can patch closure upvalue references to be open.
+-- Without the fix, the inner closure's upvalues remain closed after unpersist,
+-- so writes from the closure go to a copy instead of the outer function's local.
+do
+    local co = coroutine.create(function()
+        local captured = nil
+        local function writer()
+            captured = "written"
+        end
+        -- Push writer onto the stack and yield before calling it.
+        -- This means writer (with its open upvalue for `captured`) is a raw
+        -- value on the coroutine's stack at persist time.
+        local f = writer
+        coroutine.yield()
+        -- After round-trip, call writer. Its upvalue must be open (pointing to
+        -- our stack slot for `captured`), not closed (pointing to a copy).
+        f()
+        return captured
+    end)
+
+    coroutine.resume(co)
+    co = ares.unpersist(uperms, ares.persist(perms, co))
+    local ok, result = coroutine.resume(co)
+    assert(ok)
+    assert(result == "written", "expected 'written', got " .. tostring(result))
+end
+
+-- same test but with two closures sharing the open upvalue
+do
+    local co = coroutine.create(function()
+        local shared = 0
+        local function inc() shared = shared + 1 end
+        local function get() return shared end
+        local fi, fg = inc, get
+        coroutine.yield()
+        fi()
+        fi()
+        return fg()
+    end)
+
+    coroutine.resume(co)
+    co = ares.unpersist(uperms, ares.persist(perms, co))
+    local ok, result = coroutine.resume(co)
+    assert(ok)
+    assert(result == 2, "expected 2, got " .. tostring(result))
+end
+
+-- a coroutine whose stack capacity grew large but is now nearly empty must round-trip.
+do
+    -- a GC pass would shrink the big-empty stack and mask the bug.
+    collectgarbage("stop")
+    local co = coroutine.create(function()
+        -- Make a table and chew up tons of slot spaces, then leave them bare
+        local tab = table.create(5000, true)
+        tab = { unpack(tab, 2, 5000) }
+        local n = #tab
+        -- So that tab can't be optimized away if `#tab` can be constant-folded
+        print(tab)
+        -- Nil it out so that it won't be serialized and make the blob larger
+        tab = nil
+        coroutine.yield()
+        return n
+    end)
+    coroutine.resume(co)
+
+    co = ares.unpersist(uperms, ares.persist(perms, co))
+    local ok, result = coroutine.resume(co)
+    assert(ok)
+    assert(result == 4999, `expected 4999, got {result}`)
+    -- We can have GC now :)
+    collectgarbage("restart")
+end
 
 print('OK')
 return 'OK'

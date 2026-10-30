@@ -13,6 +13,11 @@
 #include "ldebug.h"
 #include "lvm.h"
 
+// ServerLua: yieldable table.sort
+#include "lyieldablemacros.h"
+
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableFindImprovement, false)
+
 static int foreachi(lua_State* L)
 {
     luaL_checktype(L, 1, LUA_TTABLE);
@@ -91,7 +96,33 @@ static int getn(lua_State* L)
     return 1;
 }
 
-static void moveelements(lua_State* L, int srct, int dstt, int f, int e, int t)
+static bool shouldsparsemove(LuaTable* src, LuaTable* dst, int n)
+{
+    int srcelems = src->sizearray + sizenode(src);
+    int dstelems = dst->sizearray + sizenode(dst);
+    int maxelems = srcelems > dstelems ? srcelems : dstelems;
+    const int minsparsemoveelems = 32;
+
+    return n > minsparsemoveelems && n / 2 > maxelems;
+}
+
+static bool tovalidintkey(lua_State* L, int idx, int f, int e, int* result)
+{
+    if (lua_type(L, idx) == LUA_TNUMBER)
+    {
+        double nkey = lua_tonumber(L, idx);
+
+        if (nkey >= f && nkey <= e)
+        {
+            luai_num2int(*result, nkey);
+            return luai_numeq(cast_num(*result), nkey);
+        }
+    }
+
+    return false;
+}
+
+static void moveelements(lua_State* L, int srct, int dstt, int f, int e, int t, bool sparsemove)
 {
     LuaTable* src = hvalue(L->base + (srct - 1));
     LuaTable* dst = hvalue(L->base + (dstt - 1));
@@ -127,6 +158,51 @@ static void moveelements(lua_State* L, int srct, int dstt, int f, int e, int t)
         }
 
         luaC_barrierfast(L, dst);
+    }
+    else if (sparsemove)
+    {
+        int srcta = lua_absindex(L, srct);
+        int dstta = lua_absindex(L, dstt);
+
+        int te = t + (n - 1);
+
+        // temporary table to hold elements from source that are being moved
+        lua_newtable(L);
+
+        // collect integer key elements that are being moved
+        for (int iter = 0; (iter = lua_rawiter(L, srcta, iter)) != -1;)
+        {
+            int ikey = 0;
+            if (tovalidintkey(L, -2, f, e, &ikey))
+                lua_rawseti(L, -3, ikey); // pops value
+            else
+                lua_pop(L, 1); // pop value
+
+            lua_pop(L, 1); // pop key
+        }
+
+        // clear the destination range
+        for (int iter = 0; (iter = lua_rawiter(L, dstta, iter)) != -1;)
+        {
+            int ikey = 0;
+            if (tovalidintkey(L, -2, t, te, &ikey))
+            {
+                lua_pushnil(L);
+                lua_rawseti(L, dstta, ikey);
+            }
+
+            lua_pop(L, 2);
+        }
+
+        // copy the elements from the temporary table to the destination table
+        for (int iter = 0; (iter = lua_rawiter(L, -1, iter)) != -1;)
+        {
+            int ikey = lua_tointeger(L, -2);
+            lua_rawseti(L, dstta, ikey - f + t);
+            lua_pop(L, 1);
+        }
+
+        lua_pop(L, 1);
     }
     else
     {
@@ -167,7 +243,7 @@ static int tinsert(lua_State* L)
 
         // move up elements if necessary
         if (1 <= pos && pos <= n)
-            moveelements(L, 1, 1, pos, n, pos + 1);
+            moveelements(L, 1, 1, pos, n, pos + 1, /* sparsemove */ false);
         break;
     }
     default:
@@ -189,7 +265,7 @@ static int tremove(lua_State* L)
         return 0;                // nothing to remove
     lua_rawgeti(L, 1, pos);      // result = t[pos]
 
-    moveelements(L, 1, 1, pos + 1, n, pos);
+    moveelements(L, 1, 1, pos + 1, n, pos, /* sparsemove */ false);
 
     lua_pushnil(L);
     lua_rawseti(L, 1, n); // t[n] = nil
@@ -222,15 +298,65 @@ static int tmove(lua_State* L)
         if (dst->readonly) // also checked in moveelements, but this blocks resizes of r/o tables
             luaG_readonlyerror(L);
 
+        bool sparsemove = shouldsparsemove(hvalue(L->base), dst, n);
+
         if (t > 0 && (t - 1) <= dst->sizearray && (t - 1 + n) > dst->sizearray)
         { // grow the destination table array
             luaH_resizearray(L, dst, t - 1 + n);
         }
 
-        moveelements(L, 1, tt, f, e, t);
+        moveelements(L, 1, tt, f, e, t, sparsemove);
     }
     lua_pushvalue(L, tt); // return destination table
     return 1;
+}
+
+// ServerLua: table.append(t, ...) - appends varargs to end of table
+// Semantically equivalent to consecutive `table.insert()` calls.
+static int tappend(lua_State* L)
+{
+    luaL_checkstack(L, 2, "append");
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+    int top = lua_gettop(L);
+
+    for (int i = 2; i <= top; i++)
+    {
+        lua_pushvalue(L, i);
+        lua_rawseti(L, 1, lua_objlen(L, 1) + 1);
+    }
+
+    return 0;
+}
+
+// ServerLua: table.extend(dst, src) - appends array portion of src onto dst
+// Again, this is sugar for `table.move(src, 1, #src, #dst+1, dst)`
+// which is kind of an arcane and obnoxious incantation. Bespoke array-like
+// list construction is unfortunately a pretty common requirement for `ll.*()` functions,
+// so it makes sense to provide as a first-class member of the stdlib.
+static int textend(lua_State* L)
+{
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    // ignore further arguments
+    lua_settop(L, 2);
+
+    luaL_checkstack(L, 6, "extend");
+
+    int dn = lua_objlen(L, 1);
+    int sn = lua_objlen(L, 2);
+
+    // Rearrange stack: (dst, src) -> (src, 1, sn, dn+1, dst)
+    lua_insert(L, 1);
+    lua_pushinteger(L, 1);
+    lua_insert(L, 2);
+    lua_pushinteger(L, sn);
+    lua_insert(L, 3);
+    lua_pushinteger(L, dn + 1);
+    lua_insert(L, 4);
+
+    return tmove(L);
 }
 
 static void addfield(lua_State* L, luaL_Strbuf* b, int i, LuaTable* t)
@@ -323,29 +449,91 @@ static int tunpack(lua_State* L)
     return (int)n;
 }
 
-typedef int (*SortPredicate)(lua_State* L, const TValue* l, const TValue* r);
+// ServerLua: tsort() and its constituent parts are pretty heavily modified to allow for
+// interrupt-forced yields, but the core logic is mostly the same.
 
-static int sort_func(lua_State* L, const TValue* l, const TValue* r)
+// ServerLua: Budget between yield checks for the default (non-predicate) comparator path.
+// Same concept as YIELD_BATCH_SIZE in lyieldstrlib.cpp.
+// This may be raised or lowered without breaking ABI compatibility.
+static constexpr int SORT_YIELD_BUDGET = 32;
+
+// ServerLua: Return if __lt might be invoked when comparing
+static bool sort_cmp_may_call(LuaTable* t, int i, int j)
 {
-    LUAU_ASSERT(L->top == L->base + 2); // table, function
-
-    setobj2s(L, L->top, &L->base[1]);
-    setobj2s(L, L->top + 1, l);
-    setobj2s(L, L->top + 2, r);
-    L->top += 3; // safe because of LUA_MINSTACK guarantee
-    // ServerLua: Check for interrupt to allow pre-emptive abort before calling user comparison function
-    luau_callinterrupthandler(L, LUA_INTERRUPT_STDLIB);
-    luaD_call(L, L->top - 3, 1);
-    L->top -= 1; // maintain stack depth
-
-    return !l_isfalse(L->top);
+    for (const TValue* val : {&t->array[i], &t->array[j]})
+    {
+        switch (ttype(val))
+        {
+        case LUA_TNUMBER:
+        case LUA_TSTRING:
+        case LUA_TLIGHTUSERDATA:
+            break;
+        default:
+            return true;
+        }
+    }
+    return false;
 }
+
+// ServerLua: Comparison macro for yieldable sort. Expects `t` (LuaTable*), `use_pred`
+// (bool slot), `saved_sa` (int32_t slot), and `yield_budget` (int local) to
+// be in scope. Writes result to cmp_var (bool slot). Each call site passes a
+// unique PHASE_NAME.
+//
+// Yield check fires on every comparison when use_pred is true (short-circuit
+// skips the budget decrement) or when the compare can reach a metamethod.
+// Otherwise the budget gates yield checks to every SORT_YIELD_BUDGET comparisons.
+//
+// The LuaTable* is a stable heap pointer — it never moves. Only t->array
+// and t->sizearray can change (if the comparator resizes the table), which
+// is what saved_sa detects. God do I hate that this is a macro but what can you do.
+#define SORT_CMP(cmp_var, i_idx, j_idx, phase_name)                                             \
+    if (unsigned(i_idx) >= unsigned(t->sizearray) || unsigned(j_idx) >= unsigned(t->sizearray)) \
+        luaL_error(L, "table modified during sorting");                                          \
+    if (use_pred || sort_cmp_may_call(t, i_idx, j_idx) || --yield_budget <= 0)                   \
+    {                                                                                            \
+        YIELD_CHECK(L, phase_name##_YINT, LUA_INTERRUPT_STDLIB);                                 \
+        yield_budget = SORT_YIELD_BUDGET;                                                        \
+    }                                                                                            \
+    if (use_pred)                                                                                \
+    {                                                                                            \
+        {                                                                                        \
+            saved_sa = t->sizearray;                                                             \
+            if (unsigned(i_idx) >= unsigned(saved_sa) || unsigned(j_idx) >= unsigned(saved_sa))   \
+                luaL_error(L, "table modified during sorting");                                  \
+            setobj2s(L, L->top, L->base + 2);                                                   \
+            setobj2s(L, L->top + 1, &t->array[i_idx]);                                          \
+            setobj2s(L, L->top + 2, &t->array[j_idx]);                                          \
+            L->top += 3;                                                                         \
+        }                                                                                        \
+        YIELD_CALL(L, 2, 1, phase_name);                                                         \
+        cmp_var = lua_toboolean(L, -1) != 0;                                                     \
+        lua_pop(L, 1);                                                                           \
+        if (t->sizearray != saved_sa)                                                            \
+            luaL_error(L, "table modified during sorting");                                      \
+    }                                                                                            \
+    else                                                                                         \
+    {                                                                                            \
+        int _sa = t->sizearray;                                                                  \
+        if (unsigned(i_idx) >= unsigned(_sa) || unsigned(j_idx) >= unsigned(_sa))                \
+            luaL_error(L, "table modified during sorting");                                      \
+        cmp_var = luaV_lessthan(L, &t->array[i_idx], &t->array[j_idx]);                         \
+        if (t->sizearray != _sa)                                                                 \
+            luaL_error(L, "table modified during sorting");                                      \
+    }
 
 inline void sort_swap(lua_State* L, LuaTable* t, int i, int j)
 {
+    // ServerLua: A comparator yield could allow another coroutine to freeze this table;
+    //  other code assumes frozen tables are never mutated, don't violate that invariant.
+    if (LUAU_UNLIKELY(t->readonly))
+        luaG_readonlyerror(L);
+
     TValue* arr = t->array;
     int n = t->sizearray;
-    LUAU_ASSERT(unsigned(i) < unsigned(n) && unsigned(j) < unsigned(n)); // contract maintained in sort_less after predicate call
+    // ServerLua: the array may have shrunk while the sort was suspended
+    if (LUAU_UNLIKELY(unsigned(i) >= unsigned(n) || unsigned(j) >= unsigned(n)))
+        luaL_error(L, "table modified during sorting");
 
     // no barrier required because both elements are in the array before and after the swap
     TValue temp;
@@ -354,33 +542,62 @@ inline void sort_swap(lua_State* L, LuaTable* t, int i, int j)
     setobj2t(L, t, &arr[j], &temp);
 }
 
-inline int sort_less(lua_State* L, LuaTable* t, int i, int j, SortPredicate pred)
+static void sort_siftheap(lua_State* L, SlotManager& parent_slots, int l_init, int u_init, bool use_pred_init, int root_init)
 {
-    TValue* arr = t->array;
-    int n = t->sizearray;
-    LUAU_ASSERT(unsigned(i) < unsigned(n) && unsigned(j) < unsigned(n)); // contract maintained in sort_less after predicate call
+    YIELDABLE_RETURNS_VOID;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+        CMP_LEFT_YINT = 1,
+        CMP_LEFT = 2,
+        CMP_RIGHT_YINT = 3,
+        CMP_RIGHT = 4,
+        CMP_LAST_YINT = 5,
+        CMP_LAST = 6,
+    };
 
-    int res = pred(L, &arr[i], &arr[j]);
+    SlotManager slots(parent_slots);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, root, root_init);
+    DEFINE_SLOT(int32_t, l, l_init);
+    DEFINE_SLOT(int32_t, u, u_init);
+    DEFINE_SLOT(int32_t, count, u_init - l_init + 1);
+    DEFINE_SLOT(int32_t, left, 0);
+    DEFINE_SLOT(int32_t, right, 0);
+    DEFINE_SLOT(int32_t, next, 0);
+    DEFINE_SLOT(bool, cmp, false);
+    DEFINE_SLOT(bool, use_pred, use_pred_init);
+    DEFINE_SLOT(int32_t, saved_sa, 0);
+    slots.finalize();
 
-    // predicate call may resize the table, which is invalid
-    if (t->sizearray != n)
-        luaL_error(L, "table modified during sorting");
+    LuaTable* t = hvalue(L->base + 1);
+    int yield_budget = SORT_YIELD_BUDGET;
 
-    return res;
-}
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(CMP_LEFT_YINT);
+    YIELD_DISPATCH(CMP_LEFT);
+    YIELD_DISPATCH(CMP_RIGHT_YINT);
+    YIELD_DISPATCH(CMP_RIGHT);
+    YIELD_DISPATCH(CMP_LAST_YINT);
+    YIELD_DISPATCH(CMP_LAST);
+    YIELD_DISPATCH_END();
 
-static void sort_siftheap(lua_State* L, LuaTable* t, int l, int u, SortPredicate pred, int root)
-{
     LUAU_ASSERT(l <= u);
-    int count = u - l + 1;
 
     // process all elements with two children
     while (root * 2 + 2 < count)
     {
-        int left = root * 2 + 1, right = root * 2 + 2;
-        int next = root;
-        next = sort_less(L, t, l + next, l + left, pred) ? left : next;
-        next = sort_less(L, t, l + next, l + right, pred) ? right : next;
+        left = root * 2 + 1;
+        right = root * 2 + 2;
+        next = root;
+
+        SORT_CMP(cmp, l + next, l + left, CMP_LEFT);
+        if (cmp)
+            next = left;
+
+        SORT_CMP(cmp, l + next, l + right, CMP_RIGHT);
+        if (cmp)
+            next = right;
 
         if (next == root)
             break;
@@ -390,67 +607,167 @@ static void sort_siftheap(lua_State* L, LuaTable* t, int l, int u, SortPredicate
     }
 
     // process last element if it has just one child
-    int lastleft = root * 2 + 1;
-    if (lastleft == count - 1 && sort_less(L, t, l + root, l + lastleft, pred))
-        sort_swap(L, t, l + root, l + lastleft);
-}
-
-static void sort_heap(lua_State* L, LuaTable* t, int l, int u, SortPredicate pred)
-{
-    LUAU_ASSERT(l <= u);
-    int count = u - l + 1;
-
-    for (int i = count / 2 - 1; i >= 0; --i)
-        sort_siftheap(L, t, l, u, pred, i);
-
-    for (int i = count - 1; i > 0; --i)
+    if (root * 2 + 1 == count - 1)
     {
-        sort_swap(L, t, l, l + i);
-        sort_siftheap(L, t, l, l + i - 1, pred, 0);
+        SORT_CMP(cmp, l + root, l + root * 2 + 1, CMP_LAST);
+        if (cmp)
+            sort_swap(L, t, l + root, l + root * 2 + 1);
     }
 }
 
-static void sort_rec(lua_State* L, LuaTable* t, int l, int u, int limit, SortPredicate pred)
+static void sort_heap(lua_State* L, SlotManager& parent_slots, int l_init, int u_init, bool use_pred_init)
 {
+    YIELDABLE_RETURNS_VOID;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+        BUILD_SIFT = 1,
+        SORT_SIFT = 2,
+        SORT_CHECK = 3,
+    };
+
+    SlotManager slots(parent_slots);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, l, l_init);
+    DEFINE_SLOT(int32_t, u, u_init);
+    DEFINE_SLOT(int32_t, count, u_init - l_init + 1);
+    DEFINE_SLOT(int32_t, i, count / 2 - 1);
+    DEFINE_SLOT(bool, use_pred, use_pred_init);
+    slots.finalize();
+
+    LuaTable* t = hvalue(L->base + 1);
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(BUILD_SIFT);
+    YIELD_DISPATCH(SORT_SIFT);
+    YIELD_DISPATCH(SORT_CHECK);
+    YIELD_DISPATCH_END();
+
+    LUAU_ASSERT(l <= u);
+
+    for (; i >= 0; --i)
+        YIELD_HELPER(L, BUILD_SIFT, sort_siftheap(L, slots, l, u, use_pred, i));
+
+    for (i = count - 1; i > 0; --i)
+    {
+        sort_swap(L, t, l, l + i);
+        YIELD_HELPER(L, SORT_SIFT, sort_siftheap(L, slots, l, l + i - 1, use_pred, 0));
+        YIELD_CHECK(L, SORT_CHECK, LUA_INTERRUPT_STDLIB);
+    }
+}
+
+static void sort_rec(lua_State* L, SlotManager& parent_slots, int l_init, int u_init, int limit_init, bool use_pred_init)
+{
+    YIELDABLE_RETURNS_VOID;
+    enum class Phase : uint8_t
+    {
+        DEFAULT = 0,
+        CMP_UL_YINT = 1,
+        CMP_UL = 2,
+        CMP_ML_YINT = 3,
+        CMP_ML = 4,
+        CMP_UM_YINT = 5,
+        CMP_UM = 6,
+        PART_FWD_YINT = 7,
+        PART_FWD = 8,
+        PART_REV_YINT = 9,
+        PART_REV = 10,
+        RECURSE_SMALL = 11,
+        RECURSE_LARGE = 12,
+        HEAP = 13,
+        LOOP_CHECK = 14,
+    };
+
+    SlotManager slots(parent_slots);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, l, l_init);
+    DEFINE_SLOT(int32_t, u, u_init);
+    DEFINE_SLOT(int32_t, limit, limit_init);
+    DEFINE_SLOT(bool, use_pred, use_pred_init);
+    DEFINE_SLOT(int32_t, m, 0);
+    DEFINE_SLOT(int32_t, p, 0);
+    DEFINE_SLOT(int32_t, i, 0);
+    DEFINE_SLOT(int32_t, j, 0);
+    DEFINE_SLOT(bool, cmp, false);
+    DEFINE_SLOT(int32_t, saved_sa, 0);
+    slots.finalize();
+
+    LuaTable* t = hvalue(L->base + 1);
+    int yield_budget = SORT_YIELD_BUDGET;
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(CMP_UL_YINT);
+    YIELD_DISPATCH(CMP_UL);
+    YIELD_DISPATCH(CMP_ML_YINT);
+    YIELD_DISPATCH(CMP_ML);
+    YIELD_DISPATCH(CMP_UM_YINT);
+    YIELD_DISPATCH(CMP_UM);
+    YIELD_DISPATCH(PART_FWD_YINT);
+    YIELD_DISPATCH(PART_FWD);
+    YIELD_DISPATCH(PART_REV_YINT);
+    YIELD_DISPATCH(PART_REV);
+    YIELD_DISPATCH(RECURSE_SMALL);
+    YIELD_DISPATCH(RECURSE_LARGE);
+    YIELD_DISPATCH(HEAP);
+    YIELD_DISPATCH(LOOP_CHECK);
+    YIELD_DISPATCH_END();
+
     // sort range [l..u] (inclusive, 0-based)
     while (l < u)
     {
         // if the limit has been reached, quick sort is going over the permitted nlogn complexity, so we fall back to heap sort
         if (limit == 0)
-            return sort_heap(L, t, l, u, pred);
+        {
+            YIELD_HELPER(L, HEAP, sort_heap(L, slots, l, u, use_pred));
+            return;
+        }
 
         // sort elements a[l], a[(l+u)/2] and a[u]
         // note: this simultaneously acts as a small sort and a median selector
-        if (sort_less(L, t, u, l, pred)) // a[u] < a[l]?
-            sort_swap(L, t, u, l);       // swap a[l] - a[u]
+        SORT_CMP(cmp, u, l, CMP_UL);
+        if (cmp) // a[u] < a[l]?
+            sort_swap(L, t, u, l); // swap a[l] - a[u]
         if (u - l == 1)
             break;                       // only 2 elements
-        int m = l + ((u - l) >> 1);      // midpoint
-        if (sort_less(L, t, m, l, pred)) // a[m]<a[l]?
+        m = l + ((u - l) >> 1);          // midpoint
+        SORT_CMP(cmp, m, l, CMP_ML);
+        if (cmp) // a[m]<a[l]?
             sort_swap(L, t, m, l);
-        else if (sort_less(L, t, u, m, pred)) // a[u]<a[m]?
-            sort_swap(L, t, m, u);
+        else
+        {
+            SORT_CMP(cmp, u, m, CMP_UM);
+            if (cmp) // a[u]<a[m]?
+                sort_swap(L, t, m, u);
+        }
         if (u - l == 2)
             break; // only 3 elements
 
         // here l, m, u are ordered; m will become the new pivot
-        int p = u - 1;
+        p = u - 1;
         sort_swap(L, t, m, u - 1); // pivot is now (and always) at u-1
 
         // a[l] <= P == a[u-1] <= a[u], only need to sort from l+1 to u-2
-        int i = l;
-        int j = u - 1;
+        i = l;
+        j = u - 1;
         for (;;)
         { // invariant: a[l..i] <= P <= a[j..u]
             // repeat ++i until a[i] >= P
-            while (sort_less(L, t, ++i, p, pred))
+            for (;;)
             {
+                ++i;
+                SORT_CMP(cmp, i, p, PART_FWD);
+                if (!cmp)
+                    break;
                 if (i >= u)
                     luaL_error(L, "invalid order function for sorting");
             }
             // repeat --j until a[j] <= P
-            while (sort_less(L, t, p, --j, pred))
+            for (;;)
             {
+                --j;
+                SORT_CMP(cmp, p, j, PART_REV);
+                if (!cmp)
+                    break;
                 if (j <= l)
                     luaL_error(L, "invalid order function for sorting");
             }
@@ -469,35 +786,61 @@ static void sort_rec(lua_State* L, LuaTable* t, int l, int u, int limit, SortPre
         // sort smaller half recursively; the larger half is sorted in the next loop iteration
         if (i - l < u - i)
         {
-            sort_rec(L, t, l, i - 1, limit, pred);
+            YIELD_HELPER(L, RECURSE_SMALL, sort_rec(L, slots, l, i - 1, limit, use_pred));
             l = i + 1;
         }
         else
         {
-            sort_rec(L, t, i + 1, u, limit, pred);
+            YIELD_HELPER(L, RECURSE_LARGE, sort_rec(L, slots, i + 1, u, limit, use_pred));
             u = i - 1;
         }
+
+        YIELD_CHECK(L, LOOP_CHECK, LUA_INTERRUPT_STDLIB);
     }
 }
 
-static int tsort(lua_State* L)
+DEFINE_YIELDABLE(tsort, 0)
 {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    LuaTable* t = hvalue(L->base);
-    int n = luaH_getn(t);
-    if (t->readonly)
-        luaG_readonlyerror(L);
-
-    SortPredicate pred = luaV_lessthan;
-    if (!lua_isnoneornil(L, 2)) // is there a 2nd argument?
+    YIELDABLE_RETURNS_DEFAULT;
+    enum class Phase : uint8_t
     {
-        luaL_checktype(L, 2, LUA_TFUNCTION);
-        pred = sort_func;
+        DEFAULT = 0,
+        SORT = 1,
+    };
+
+    // Validated before the yield slot shifts the arguments, so errors name
+    // the caller's indices
+    if (is_init)
+    {
+        luaL_checktype(L, 1, LUA_TTABLE);
+        if (!lua_isnoneornil(L, 2))
+            luaL_checktype(L, 2, LUA_TFUNCTION);
     }
-    lua_settop(L, 2); // make sure there are two arguments
+
+    SlotManager slots(L, is_init, abi_version);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, n, 0);
+    DEFINE_SLOT(bool, use_pred, false);
+    slots.finalize();
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(SORT);
+    YIELD_DISPATCH_END();
+
+    if (slots.isInit())
+    {
+        LuaTable* t = hvalue(L->base + 1);
+        n = luaH_getn(t);
+        if (t->readonly)
+            luaG_readonlyerror(L);
+
+        use_pred = !lua_isnoneornil(L, 3);
+        lua_settop(L, 3);
+    }
 
     if (n > 0)
-        sort_rec(L, t, 0, n - 1, n, pred);
+        YIELD_HELPER(L, SORT, sort_rec(L, slots, 0, n - 1, n, use_pred));
+
     return 0;
 }
 
@@ -528,22 +871,60 @@ static int tcreate(lua_State* L)
     return 1;
 }
 
-static int tfind(lua_State* L)
+// ServerLua: made this yieldable due to __eq hooks. Upstream's
+// LuauTableFindImprovement / luaH_rawfind version was dropped intentionally.
+DEFINE_YIELDABLE(tfind, 0)
 {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    luaL_checkany(L, 2);
-    int init = luaL_optinteger(L, 3, 1);
-    if (init < 1)
-        luaL_argerror(L, 3, "index out of range");
-
-    LuaTable* t = hvalue(L->base);
-    StkId v = L->base + 1;
-
-    for (int i = init;; ++i)
+    YIELDABLE_RETURNS_DEFAULT;
+    enum class Phase : uint8_t
     {
+        DEFAULT = 0,
+        LOOP = 1,
+    };
+
+    // Validated before the yield slot shifts the arguments, so errors name
+    // the caller's indices
+    int init = 1;
+    if (is_init)
+    {
+        luaL_checktype(L, 1, LUA_TTABLE);
+        luaL_checkany(L, 2);
+        init = luaL_optinteger(L, 3, 1);
+        if (init < 1)
+            luaL_argerror(L, 3, "index out of range");
+    }
+
+    SlotManager slots(L, is_init, abi_version);
+    DEFINE_SLOT(Phase, phase, Phase::DEFAULT);
+    DEFINE_SLOT(int32_t, i, init);
+    slots.finalize();
+
+    if (slots.isInit())
+        lua_settop(L, 3);
+
+    // ServerLua: __eq can only fire if the search value is a table or userdata;
+    // equalobj short-circuits on ttype mismatch before reaching luaV_equalval.
+    int search_type = lua_type(L, 3);
+    // We could probably gate this on tables also having an __eq-bearing metatable,
+    // but I suppose tables could be mutated during iteration...
+    bool needs_yield = search_type == LUA_TTABLE || search_type == LUA_TUSERDATA;
+
+    LuaTable* t = hvalue(L->base + 1);
+
+    YIELD_DISPATCH_BEGIN(phase, slots);
+    YIELD_DISPATCH(LOOP);
+    YIELD_DISPATCH_END();
+
+    for (;; ++i)
+    {
+        if (needs_yield)
+            YIELD_CHECK(L, LOOP, LUA_INTERRUPT_STDLIB);
+
         const TValue* e = luaH_getnum(t, i);
         if (ttisnil(e))
             break;
+
+        StkId v = L->base + 2;
 
         if (equalobj(L, v, e))
         {
@@ -599,7 +980,7 @@ static int tclone(lua_State* L)
 
     TValue v;
     sethvalue(L, &v, tt);
-    luaA_pushobject(L, &v);
+    luaA_pushvalue(L, &v);
 
     return 1;
 }
@@ -614,11 +995,11 @@ static int tshrink(lua_State* L)
     if (t->readonly)
         luaG_readonlyerror(L);
 
-    if (t->memcat < 2)
+    if (t->memcat < LUA_FIRST_USER_MEMCAT)
         luaL_argerror(L, 1, "cannot shrink system table");
 
-    bool reorder = lua_toboolean(L, 2) != 0;
-    luaH_shrink(L, t, reorder);
+    bool shrink_sparse = lua_toboolean(L, 2) != 0;
+    luaH_shrink(L, t, shrink_sparse);
     lua_pushvalue(L, 1);
     return 1;
 }
@@ -631,23 +1012,30 @@ static const luaL_Reg tab_funcs[] = {
     {"maxn", maxn},
     {"insert", tinsert},
     {"remove", tremove},
-    {"sort", tsort},
     {"pack", tpack},
     {"unpack", tunpack},
     {"move", tmove},
     {"create", tcreate},
-    {"find", tfind},
     {"clear", tclear},
     {"freeze", tfreeze},
     {"isfrozen", tisfrozen},
     {"clone", tclone},
     {"shrink", tshrink},
+    // ServerLua: table.append, table.extend
+    {"append", tappend},
+    {"extend", textend},
     {NULL, NULL},
 };
 
 int luaopen_table(lua_State* L)
 {
     luaL_register(L, LUA_TABLIBNAME, tab_funcs);
+
+    // ServerLua: override sort and find registration with yieldable versions (need continuation)
+    lua_pushcclosurek(L, tsort, "sort", 0, tsort_k);
+    lua_setfield(L, -2, "sort");
+    lua_pushcclosurek(L, tfind, "find", 0, tfind_k);
+    lua_setfield(L, -2, "find");
 
     // Lua 5.1 compat
     lua_pushcfunction(L, tunpack, "unpack");

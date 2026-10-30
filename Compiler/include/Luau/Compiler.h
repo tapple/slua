@@ -5,6 +5,9 @@
 #include "Luau/Location.h"
 #include "Luau/StringUtils.h"
 #include "Luau/Common.h"
+#include "Luau/BytecodeHeader.h"
+
+#include <exception>
 
 namespace Luau
 {
@@ -54,6 +57,10 @@ struct CompileOptions
     // alternative vector type name for type tables, in addition to default type 'vector'
     const char* vectorType = nullptr;
 
+    // 0 - 32-bit float vector components
+    // 1 - 64-bit double vector components
+    int vectorPrecision = 0;
+
     // null-terminated array of globals that are mutable; disables the import optimization for fields accessed through these
     const char* const* mutableGlobals = nullptr;
 
@@ -75,9 +82,9 @@ class CompileError : public std::exception
 public:
     CompileError(const Location& location, std::string message);
 
-    virtual ~CompileError() throw();
+    ~CompileError() throw() override;
 
-    virtual const char* what() const throw();
+    const char* what() const throw() override;
 
     const Location& getLocation() const;
 
@@ -100,10 +107,23 @@ std::string compile(
     BytecodeEncoder* encoder = nullptr
 );
 
+// ServerLua: compiles a complete asset, a BytecodeHeader followed by the
+// bytecode. Throws on errors rather than encoding one in the return value:
+// nothing stores a failed compile, so there is no asset shape to put it in.
+std::string compileAssetOrThrow(
+    const std::string& source,
+    uint32_t apiVersion = 0,
+    const CompileOptions& options = {},
+    const ParseOptions& parseOptions = {},
+    BytecodeEncoder* encoder = nullptr
+);
+
 void setCompileConstantNil(CompileConstant* constant);
 void setCompileConstantBoolean(CompileConstant* constant, bool b);
 void setCompileConstantNumber(CompileConstant* constant, double n);
+void setCompileConstantInteger64(CompileConstant* constant, int64_t l);
 void setCompileConstantVector(CompileConstant* constant, float x, float y, float z, float w);
+void setCompileConstantVectord(CompileConstant* constant, double x, double y, double z, double w);
 void setCompileConstantString(CompileConstant* constant, const char* s, size_t l);
 
 } // namespace Luau

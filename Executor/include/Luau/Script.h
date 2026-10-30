@@ -1,0 +1,344 @@
+// ServerLua: the per-script runtime instance driven by the script host.
+#pragma once
+
+#include <memory>
+#include <string>
+
+#include "lua.h"
+
+#include "Luau/ByteStream.h"
+#include "Luau/Executor.h"
+#include "Luau/LSLBuiltins.h"
+
+namespace Luau
+{
+namespace Executor
+{
+
+enum class HandlerRunStatus : uint8_t
+{
+    // Handler ran to completion, handler thread was reset
+    Ok = 0,
+    // Handler was preempted or yielded mid-execution, resume it later
+    Preempted,
+    // LSL only. handler requested a state change and finished, newState holds
+    // the new state number
+    StateChange,
+    // Handler errored, fault fields were updated, handler thread was reset
+    Fault,
+    // The script has no handler for this event
+    NotRun,
+    // There's already a handler function staged, we can't run this.
+    Refused,
+};
+
+enum class FaultKind : uint8_t
+{
+    None = 0,
+    Runtime,
+    OutOfMemory,
+    Timeout,
+    UnexpectedYield,
+    Unknown = 255,
+};
+
+struct RunResult
+{
+    HandlerRunStatus status = HandlerRunStatus::Ok;
+    int newState = 0;
+    // True when this run cleanly completed the SLua main function, so the
+    // host can finalize its view of the handler registrations exactly once.
+    bool mainFunctionCompleted = false;
+};
+
+// Payload format written by Script::serializeState(). Leads every payload as
+// the family magic and versions the core section only; the concrete class's
+// fingerprint follows it and versions the extra section, so the two evolve
+// independently. Each fingerprint is followed by its section's required
+// feature mask, zero until a feature exists; see serializeState().
+constexpr StateFingerprint kScriptStateFingerprint{{'E', 'X', 'E', 'C'}, 3, 0};
+
+// We need to carry around the error messages in our state, but
+// the messages can be arbitrarily large. Cap them.
+constexpr size_t kMaxPersistedFaultLen = 2048;
+
+// Callback used to push args after an event handler function to
+// prepare it to be called.
+using PushArgsFn = void (*)(lua_State* handler, void* ctx);
+
+// Our analogue of the LLScriptExecute object present in indra.
+class Script : protected lua_SLRuntimeState
+{
+public:
+    Script(const std::shared_ptr<IImage>& image, const ScriptConfig& config);
+
+    virtual ~Script();
+
+    Script(const Script&) = delete;
+    Script& operator=(const Script&) = delete;
+
+    IProvisioner& getProvisioner() const { return mImage->getProvisioner(); }
+    IImage& getImage() const { return *mImage; }
+    IEnvironment& getEnvironment() const { return mImage->getEnvironment(); }
+    bool isLSL() const { return mIsLSL; }
+    uint32_t getAPIVersion() const { return mAPIVersion; }
+
+    // Recover the script from any thread in its instance tree
+    static Script* fromLuaState(lua_State* L);
+
+    // Installs the interrupt, userthread and allocation callbacks a script
+    // needs onto a freshly created VM. Generally done when the environment
+    // is created.
+    static void installVMCallbacks(lua_State* L);
+
+    lua_State* getInstanceState() const { return mInstance.thread(); }
+    // The handler thread while a handler is executing, null otherwise. Lets us
+    // distinguish between the engine-created top-level handler thread and any
+    // descendant threads created by the script.
+    lua_State* getHandlerState() const { return mHandlerState; }
+    // True while a forked instance exists (reset()/restoreState() succeeded)
+    bool hasInstance() const { return (bool)mInstance; }
+
+    // Forks the image's pristine default state into a fresh instance and
+    // stages its main function as the first handler, for either flavor. Only
+    // valid while no instance exists, same as restoreState().
+    bool loadDefaultState();
+
+    // Drops any live instance and returns the script to the image's default
+    // state. Unlike loadDefaultState(), this is valid at any time, though
+    // they're functionally the same.
+    bool reset();
+
+    // Start a run window for `quanta` seconds. Pair with endRunWindow().
+    void beginRunWindow(double quanta);
+    // isYieldDue(), getExcludedTime() and getSleep() stay readable until the
+    // next begin. Clears any force-yield.
+    void endRunWindow();
+    // True once the engine has decided the current run window is over, sticky
+    // for the rest of the window.
+    bool isYieldDue() const { return mYieldDue; }
+
+    // Make the current window yield at its next safepoint. Port of the host's
+    // `getReset() || !mIsEnabled` check. Cleared by endRunWindow().
+    void setForceYield(bool force);
+
+    // Only has meaning for embedders, in `indra` this allows us to get the wrapping
+    // `LLScriptExecute` ptr.
+    void *getHostContext() const { return mHostContext; }
+
+    // Call an event handler in the current state, works for both LSL and Lua.
+    // `event_index` is the event's number in the LSLBuiltins registry, which
+    // asserts on one it doesn't know.
+    RunResult callEventHandler(int event_index, PushArgsFn pushArgs, void* push_args_ctx = nullptr);
+    // Resumes a previously preempted handler (or the staged SLua main function)
+    RunResult resumeEventHandler();
+
+    // The indra registers, bitfields in the asset header's mask space (bit
+    // n - 1 for event n). The engine only ever interprets the state_entry and
+    // state_exit bits.
+    // Bit of the handler in flight, zero between handlers. The staged main
+    // function counts as state_entry for both flavors.
+    uint64_t getCurrentHandler() const { return mCurrentHandler; }
+    // Last non-zero value of the above, for attribution after the fact
+    uint64_t getStickyHandler() const { return mStickyHandler; }
+    // Events awaiting dispatch. The host ORs its queued events in; the engine
+    // only raises and clears the two state bits.
+    uint64_t getCurrentEvents() const { return mCurrentEvents; }
+    void setCurrentEvents(uint64_t events) { mCurrentEvents = events; }
+    // Events the current state handles. LSL takes it off the asset header;
+    // SLua is told by the host as handlers come and go.
+    uint64_t getEventHandlers() const { return mEventHandlers; }
+    void setEventHandlers(uint64_t handlers);
+    // False while the handler set may still grow, so the host should queue
+    // greedily rather than filter on getEventHandlers()
+    bool eventHandlersKnown() const { return hasInstance() && (mIsLSL || mMainFunctionComplete); }
+
+    // LSL state registers. A handler's `state` statement sets the next state;
+    // the host runs any state_exit, then commits with nextState().
+    int getCurrentState() const { return mCurrentState; }
+    int getNextState() const { return mNextState; }
+    bool isStateChangePending() const { return mCurrentState != mNextState; }
+    // Commits the pending change: the new state's handlers, with state_entry
+    // as the only pending event if the state handles it. Returns the new
+    // handler set.
+    uint64_t nextState();
+    // True when the handler thread holds a resumable in-progress handler
+    bool isHandlerActive() const;
+    // Discards a resumable in-progress handler without completing it, for a
+    // host that has lost track of whether a handler is in flight. The script
+    // is faulted, since nothing it left half-done can be trusted. A no-op when
+    // nothing is resumable.
+    void abortHandler();
+
+    bool isMainFunctionComplete() const { return mMainFunctionComplete; }
+
+    bool serializeState(std::string& out);
+
+    // Rebuilds the instance from a serializeState() payload. Only valid while
+    // no valid instance exists.
+    bool restoreState(const char* data, size_t len);
+
+    int getUsedMemory();
+    bool setMemoryLimit(int memory_limit);
+    void setMemoryLimitUnsafe(int memory_limit);
+    int getMemoryLimit() const { return mMemoryLimit; }
+
+    FaultKind getFaultKind() const { return mFaultKind; }
+    const std::string& getFaultString() const { return mFaultString; }
+    // Fault message plus a debug traceback when one was available
+    const std::string& getExtendedFaultString() const { return mExtendedFaultString; }
+    void clearFault();
+    void setFault(FaultKind kind, const char* fault_string, const char* extended = nullptr);
+
+    // How long we've been told to sleep. Never decremented; the host zeroes it once the sleep
+    // is served, which beginRunWindow() requires it to have done.
+    float getSleep() const { return mSleep; }
+    void setSleep(float sleep);
+
+    // Wall time excluded from punishment accounting in the current window
+    double getExcludedTime() const { return mExcludedTime; }
+
+    // Billed per allocation so a window's garbage, collected after the window
+    // with the GC parked, isn't free. A fixed rate rather than the measured
+    // catch-up, which the pacer makes vary between identical windows.
+    static constexpr double kAllocationChargeSeconds = 50e-9;
+    double getAllocationCharge() const { return mWindowAllocations * kAllocationChargeSeconds; }
+
+protected:
+    // Written whole after kScriptStateFingerprint in every payload this class
+    // produces, so a fixed offset says which class a payload belongs to. The
+    // tag must match on restore, refusing a payload meant for another class
+    // before anything is forked. The version covers the extra section.
+    virtual StateFingerprint getStateFingerprint() const { return kScriptStateFingerprint; }
+
+    // Durable subclass state, written in its own length-prefixed section after
+    // our own fields: positional fields, then a block (ByteWriter::Block) for
+    // each later feature. The reader gets a ByteReader bounded to the section,
+    // walks its blocks with ByteReader::blocks() and returns reader.ok(); we
+    // ignore whatever it leaves unread. `major`/`minor` are what the payload's
+    // getStateFingerprint() said, for diagnostics; later fields are found by
+    // their blocks. A subclass partway down a hierarchy chains to its base
+    // before its own, each level in a nested section of its own so blocks
+    // don't mix.
+    virtual bool serializeExtra(ByteWriter&) const { return true; }
+    virtual bool restoreExtra(ByteReader&, uint32_t major, uint32_t minor) { return true; }
+
+    static void interruptHandler(lua_State* L, int gc);
+    static int memoryLimitCallback(lua_State* L, size_t osize, size_t nsize);
+    static void userThreadCallback(lua_State* LP, lua_State* L);
+    static int threadUseCallback(lua_State* L, lua_State* co, int inspect);
+
+    // Source string for log messages, so subclasses log with the same attribution
+    const char* logSource() const { return mScriptId.c_str(); }
+
+private:
+    class ExecutionScope;
+    class HandlerScope;
+
+    void tryYield(lua_State* L, double elapsed, bool mandatory = false);
+    void setLuaFaultFromStatus(lua_State* L, int status);
+    RunResult handleEventHandlerStatus(int status);
+    void destroyHandlerThread();
+    void pushEventHandlerFunction(lua_State* L, const char* event_name);
+    // The asset's handler mask for `state`, zero for SLua or a state it lacks
+    uint64_t stateHandlerMask(int state) const;
+
+    // Opaque per-script host context copied onto the Script. In lscript terms,
+    // this is the `LLScriptExecuteLuau` instance.
+    void* mHostContext = nullptr;
+
+    // Keeps the image (and through it the environment) alive for as long
+    // as the script exists
+    std::shared_ptr<IImage> mImage;
+
+    // Cached properties from the parent `IImage` to reduce pointer chasing
+    bool mIsLSL = false;
+    uint32_t mAPIVersion = 0;
+    size_t mChargedBytecodeSize = 0;
+    std::string mScriptId;
+
+    // Underlying state instance currently associated with this Script container.
+    // The state itself may be nullptr as a sentinel to indicate that we're not
+    // currently able to run this (e.g. due to a script fault, or not yet started)
+    Instance mInstance;
+    // Points at the handler thread only while a handler is executing
+    lua_State* mHandlerState = nullptr;
+
+    // The indra registers, see the accessors. All persisted.
+    uint64_t mCurrentHandler = 0;
+    uint64_t mStickyHandler = 0;
+    uint64_t mCurrentEvents = 0;
+    uint64_t mEventHandlers = 0;
+    int mCurrentState = 0;
+    int mNextState = 0;
+
+    int mMemoryLimit = kDefaultMemoryLimit;
+    int mExactSize = 0;
+    int mMaxPossibleSize = 0;
+    bool mExactSizeDirty = true;
+
+    // Monotonic stopwatch used for quanta-elapsed measurement, seeded from the
+    // provisioner's.
+    QuantaClock mQuantaClockProvider = nullptr;
+    // Puts the interrupt handler on mCallbacks by each run window's deadline
+    InterruptInstaller* mInterruptInstaller = nullptr;
+    // The environment VM's, which outlives us
+    lua_Callbacks* mCallbacks = nullptr;
+
+    // When did we start running
+    double mWindowStart = 0.0;
+    // How long are we supposed to run?
+    double mQuanta = 0.0;
+    // Wall time this window spent inside reachability walks.
+    double mExcludedTime = 0.0;
+    // Allocations admitted this window, billed through getAllocationCharge()
+    uint32_t mWindowAllocations = 0;
+    // When we're supposed to invoke GC next. Held here since we disable GC during a run.
+    // TODO: there is probably some threshold of churn after which we want a script to take
+    //  a nap. There needs to be some quantifiable cost for abusive garbage creation during
+    //  a quanta, but we don't really have a "proper" scheduler that would let us deprioritize.
+    //  All we have is the blunt instrument of "sleep"... When there is one, churn should
+    //  accrue in memoryLimitCallback(), where each allocation is attributable to a script.
+    size_t mSavedGCThreshold = 0;
+    // We've planned a script kill for this time, the script will be killed if
+    // it doesn't finish before the deadline.
+    double mMandatoryDeadline = 0.0;
+    float mSleep = 0.0f;
+    bool mRunWindowOpen = false;
+    // The engine has decided that the run window is over.
+    bool mYieldDue = false;
+    // We already threw a catchable error trying to force a yield.
+    bool mMandatoryYieldRaised = false;
+    bool mInExecution = false;
+    bool mMainFunctionComplete = false;
+    // The host has indicated that a yield should happen at the next interrupt.
+    // TODO: Hmm. Seems we might be able to merge this with `mYieldDue` if we're smart.
+    bool mForceYield = false;
+
+    FaultKind mFaultKind = FaultKind::None;
+    std::string mFaultString;
+    std::string mExtendedFaultString;
+};
+
+/// An execution span for a single script that may contain multiple handler invocations.
+/// The script must outlive the guard.
+class RunWindow
+{
+public:
+    RunWindow(Script& script, double quanta);
+    ~RunWindow();
+
+    RunWindow(RunWindow&& other) noexcept;
+    RunWindow(const RunWindow&) = delete;
+    RunWindow& operator=(const RunWindow&) = delete;
+    RunWindow& operator=(RunWindow&&) = delete;
+
+    // End the window early. No-op if it's already closed.
+    void close();
+
+private:
+    Script* mScript;
+};
+
+} // namespace Executor
+} // namespace Luau

@@ -24,15 +24,15 @@ struct SimplifyResult
 
 SimplifyResult simplifyIntersection(NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena, TypeId left, TypeId right);
 
-// Clip with LuauSimplifyIntersectionNoTreeSet
-SimplifyResult simplifyIntersection_DEPRECATED(NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena, std::set<TypeId> parts);
-
 SimplifyResult simplifyIntersection(NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena, TypeIds parts);
 
 SimplifyResult simplifyUnion(NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena, TypeId left, TypeId right);
 
 SimplifyResult simplifyIntersectWithTruthy(NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena, TypeId target);
+
 SimplifyResult simplifyIntersectWithFalsy(NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena, TypeId target);
+
+SimplifyResult simplifyWithUnionOfNegation(NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena, TypeId target, TypeId toBeNegated);
 
 std::optional<TypeId> intersectWithSimpleDiscriminant(
     NotNull<BuiltinTypes> builtinTypes,
